@@ -91,3 +91,4 @@ src/screens/ModelsScreen.tsx    # model library / download manager
   builds llama.cpp ships for each device automatically.
 - **Everything is on-device**: prompts, chat history, and model files
   never leave the phone — there's no backend at all.
+
