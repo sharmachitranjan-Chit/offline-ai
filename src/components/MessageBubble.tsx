@@ -1,26 +1,89 @@
-import React from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import React, { useState } from 'react';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { ChatMessage } from '../context/LlamaContext';
+import { DocKit } from '../native/DocKit';
+import AttachmentChip from './AttachmentChip';
+import Markdown from './Markdown';
 import { colors, fontSizes, radius, spacing } from '../theme';
 
-export default function MessageBubble({ message }: { message: ChatMessage }) {
+export default function MessageBubble({
+  message,
+  maxWidth,
+  showReasoning,
+  streaming,
+}: {
+  message: ChatMessage;
+  maxWidth: number;
+  showReasoning: boolean;
+  streaming?: boolean;
+}) {
+  const [expanded, setExpanded] = useState(false);
   const isUser = message.role === 'user';
+  const hasReasoning = !!message.reasoning?.trim();
+
   return (
     <View
       style={[
         styles.row,
-        { justifyContent: isUser ? 'flex-end' : 'flex-start' },
-      ]}
-    >
+        isUser ? styles.rowUser : styles.rowAssistant,
+      ]}>
       <View
         style={[
           styles.bubble,
-          isUser ? styles.userBubble : styles.assistantBubble,
-        ]}
-      >
-        <Text style={styles.text}>
-          {message.content.length ? message.content : '…'}
-        </Text>
+          { maxWidth },
+          isUser ? styles.bubbleUser : styles.bubbleAssistant,
+          message.error && styles.bubbleError,
+        ]}>
+        {!!message.attachments?.length && (
+          <View style={styles.attachments}>
+            {message.attachments.map(a => (
+              <AttachmentChip key={a.id} attachment={a} compactPreview />
+            ))}
+          </View>
+        )}
+
+        {hasReasoning && (showReasoning || expanded) && (
+          <View style={styles.reasoning}>
+            <Text style={styles.reasoningLabel}>Reasoning</Text>
+            <Text style={styles.reasoningText}>{message.reasoning}</Text>
+          </View>
+        )}
+
+        {!!message.content && (
+          isUser ? (
+            <Text style={styles.userText} selectable>
+              {message.content}
+            </Text>
+          ) : (
+            <Markdown content={message.content} />
+          )
+        )}
+
+        {!message.content && streaming && (
+          <Text style={styles.thinking}>
+            {hasReasoning ? 'Thinking…' : 'Generating…'}
+          </Text>
+        )}
+
+        {!isUser && !!message.content && !streaming && (
+          <View style={styles.footer}>
+            {hasReasoning && !showReasoning && (
+              <Pressable onPress={() => setExpanded(v => !v)} hitSlop={8}>
+                <Text style={styles.action}>
+                  {expanded ? 'Hide reasoning' : 'Show reasoning'}
+                </Text>
+              </Pressable>
+            )}
+            <Pressable
+              onPress={() => DocKit.setClipboard(message.content)}
+              hitSlop={8}>
+              <Text style={styles.action}>Copy</Text>
+            </Pressable>
+            {!!message.tps && (
+              <Text style={styles.stat}>{message.tps.toFixed(1)} tok/s</Text>
+            )}
+          </View>
+        )}
       </View>
     </View>
   );
@@ -28,29 +91,67 @@ export default function MessageBubble({ message }: { message: ChatMessage }) {
 
 const styles = StyleSheet.create({
   row: {
+    paddingHorizontal: spacing.lg,
+    marginBottom: spacing.md,
     flexDirection: 'row',
-    paddingHorizontal: spacing.md,
-    marginVertical: spacing.xs,
   },
+  rowUser: { justifyContent: 'flex-end' },
+  rowAssistant: { justifyContent: 'flex-start' },
   bubble: {
-    maxWidth: '82%',
+    borderRadius: radius.md,
     paddingHorizontal: spacing.md,
-    paddingVertical: spacing.sm,
-    borderRadius: radius.lg,
+    paddingVertical: spacing.md,
   },
-  userBubble: {
+  bubbleUser: {
     backgroundColor: colors.bubbleUser,
-    borderBottomRightRadius: radius.sm,
+    borderBottomRightRadius: radius.xs,
   },
-  assistantBubble: {
+  bubbleAssistant: {
     backgroundColor: colors.bubbleAssistant,
-    borderBottomLeftRadius: radius.sm,
     borderWidth: 1,
-    borderColor: colors.border,
+    borderColor: colors.borderSoft,
+    borderBottomLeftRadius: radius.xs,
   },
-  text: {
+  bubbleError: {
+    borderColor: colors.danger,
+    backgroundColor: colors.dangerSoft,
+  },
+  attachments: { flexDirection: 'row', flexWrap: 'wrap', marginBottom: spacing.xs },
+  userText: {
     color: colors.textPrimary,
     fontSize: fontSizes.md,
-    lineHeight: 20,
+    lineHeight: 21,
   },
+  thinking: {
+    color: colors.textSecondary,
+    fontSize: fontSizes.sm,
+    fontStyle: 'italic',
+  },
+  reasoning: {
+    backgroundColor: colors.surfaceHigh,
+    borderRadius: radius.xs,
+    padding: spacing.sm,
+    marginBottom: spacing.sm,
+  },
+  reasoningLabel: {
+    color: colors.textFaint,
+    fontSize: fontSizes.xxs,
+    textTransform: 'uppercase',
+    letterSpacing: 0.6,
+    marginBottom: 2,
+  },
+  reasoningText: {
+    color: colors.textSecondary,
+    fontSize: fontSizes.xs,
+    lineHeight: 18,
+    fontStyle: 'italic',
+  },
+  footer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.lg,
+    marginTop: spacing.sm,
+  },
+  action: { color: colors.textFaint, fontSize: fontSizes.xs, fontWeight: '600' },
+  stat: { color: colors.textFaint, fontSize: fontSizes.xxs, marginLeft: 'auto' },
 });

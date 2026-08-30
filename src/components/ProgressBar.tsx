@@ -1,24 +1,30 @@
 import React from 'react';
 import { StyleSheet, View } from 'react-native';
-import { colors } from '../theme';
+import { colors, radius } from '../theme';
 
-type Props = {
-  fraction: number; // 0..1
+export default function ProgressBar({
+  fraction,
+  color = colors.accent,
+  height = 4,
+}: {
+  /** 0..1, or a negative number when the total size is unknown. */
+  fraction: number;
   color?: string;
   height?: number;
-};
-
-export default function ProgressBar({ fraction, color, height = 6 }: Props) {
+}) {
   const clamped = Math.max(0, Math.min(1, fraction));
+  const indeterminate = fraction < 0;
+
   return (
     <View style={[styles.track, { height, borderRadius: height / 2 }]}>
       <View
         style={[
           styles.fill,
           {
-            width: `${clamped * 100}%`,
-            backgroundColor: color ?? colors.accent,
+            width: indeterminate ? '35%' : `${clamped * 100}%`,
+            backgroundColor: color,
             borderRadius: height / 2,
+            opacity: indeterminate ? 0.55 : 1,
           },
         ]}
       />
@@ -29,10 +35,9 @@ export default function ProgressBar({ fraction, color, height = 6 }: Props) {
 const styles = StyleSheet.create({
   track: {
     width: '100%',
-    backgroundColor: colors.surfaceAlt,
+    backgroundColor: colors.surfaceHigh,
     overflow: 'hidden',
+    borderRadius: radius.pill,
   },
-  fill: {
-    height: '100%',
-  },
+  fill: { height: '100%' },
 });
