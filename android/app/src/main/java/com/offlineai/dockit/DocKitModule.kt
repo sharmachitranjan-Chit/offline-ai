@@ -86,7 +86,7 @@ class DocKitModule(private val ctx: ReactApplicationContext) :
 
     @ReactMethod
     fun pickFiles(options: ReadableMap, promise: Promise) {
-        val activity = currentActivity
+        val activity = ctx.currentActivity
         if (activity == null) {
             promise.reject("no_activity", "No foreground activity to show a picker from.")
             return
@@ -116,7 +116,12 @@ class DocKitModule(private val ctx: ReactApplicationContext) :
         }
     }
 
-    override fun onActivityResult(a: Activity?, requestCode: Int, resultCode: Int, data: Intent?) {
+    override fun onActivityResult(
+        activity: Activity,
+        requestCode: Int,
+        resultCode: Int,
+        data: Intent?,
+    ) {
         if (requestCode != REQ_PICK) return
         val promise = pickPromise ?: return
         pickPromise = null
@@ -146,7 +151,7 @@ class DocKitModule(private val ctx: ReactApplicationContext) :
         promise.resolve(out)
     }
 
-    override fun onNewIntent(intent: Intent?) {}
+    override fun onNewIntent(intent: Intent) {}
 
     private fun describeUri(uri: Uri): WritableMap {
         val map = Arguments.createMap()
@@ -679,7 +684,7 @@ class DocKitModule(private val ctx: ReactApplicationContext) :
      */
     @ReactMethod
     fun setImmersive(enabled: Boolean) {
-        val activity = currentActivity ?: return
+        val activity = ctx.currentActivity ?: return
         activity.runOnUiThread {
             val window = activity.window
             WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -696,7 +701,7 @@ class DocKitModule(private val ctx: ReactApplicationContext) :
 
     @ReactMethod
     fun setKeepScreenOn(enabled: Boolean) {
-        val activity = currentActivity ?: return
+        val activity = ctx.currentActivity ?: return
         activity.runOnUiThread {
             if (enabled) {
                 activity.window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
