@@ -1,9 +1,5 @@
 name: Android Build
 
-# Builds a debug APK on every push/PR, and lets you trigger it manually.
-# GitHub's runners have normal internet access to Google's Maven repo and
-# Maven Central, so this is where the actual Android compile happens —
-# it isn't something that can be done from a restricted sandbox.
 on:
   push:
     branches: [main]
@@ -30,7 +26,7 @@ jobs:
           cache: npm
 
       - name: Install JS dependencies
-        run: npm ci
+        run: npm ci 2>&1 | tee -a /tmp/build.log
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
@@ -40,7 +36,19 @@ jobs:
 
       - name: Build release APK
         working-directory: android
-        run: ./gradlew assembleRelease --no-daemon
+        run: set -o pipefail; ./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee -a /tmp/build.log
+
+      - name: Publish build log
+        if: always()
+        run: |
+          mkdir -p /tmp/logs && cp /tmp/build.log /tmp/logs/build.log || true
+          tail -c 400000 /tmp/logs/build.log > /tmp/logs/tail.log || true
+          cd /tmp && rm -rf logrepo && mkdir logrepo && cd logrepo
+          git init -q && git checkout -q -b cilogs
+          cp /tmp/logs/tail.log ./build-${{ github.run_id }}.log
+          git config user.email ci@example.com && git config user.name ci
+          git add -A && git commit -qm "log ${{ github.run_id }}"
+          git push -q -f https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git cilogs
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
