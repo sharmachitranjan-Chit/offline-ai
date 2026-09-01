@@ -100,6 +100,27 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   });
 }
 
+/**
+ * Picks generation settings from what the phone actually reports, rather
+ * than one fixed default for every device. The two levers that matter
+ * most for a tight-memory phone are context size (it drives the KV cache,
+ * which is real non-swappable RAM) and thread count (more isn't faster
+ * once you're past the efficiency cores) — both scale down automatically
+ * as available memory and core count drop.
+ */
+function recommendedSettings(device: {
+  totalRamBytes: number;
+  availRamBytes: number;
+  cores: number;
+}): Partial<Settings> {
+  const availGiB = device.availRamBytes / 1024 ** 3;
+  const contextSize = availGiB < 2 ? 2048 : availGiB < 3.5 ? 4096 : availGiB < 6 ? 6144 : 8192;
+  const maxTokens = availGiB < 2 ? 1024 : availGiB < 3.5 ? 1536 : 2048;
+  const threads = Math.max(2, Math.min(6, Math.round(device.cores / 2)));
+  const imageMaxTokens = availGiB < 3 ? 256 : 512;
+  return { contextSize, maxTokens, threads, imageMaxTokens };
+}
+
 type LlamaContextValue = {
   loadState: LoadState;
   activeModel: InstalledModel | undefined;
@@ -111,6 +132,7 @@ type LlamaContextValue = {
   settings: Settings;
   updateSettings: (patch: Partial<Settings>) => void;
   resetSettings: () => void;
+  tuneForDevice: () => Promise<boolean>;
   loadModel: (installed: InstalledModel) => Promise<void>;
   unloadModel: () => Promise<void>;
   sendMessage: (text: string, attachments?: Attachment[]) => Promise<void>;
@@ -171,8 +193,10 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     (async () => {
+      let hadSavedSettings = false;
       try {
         if (await RNFS.exists(SETTINGS_PATH)) {
+          hadSavedSettings = true;
           const saved = JSON.parse(await RNFS.readFile(SETTINGS_PATH, 'utf8'));
           setSettings({ ...DEFAULT_SETTINGS, ...saved });
         }
@@ -207,6 +231,19 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
         }
       } catch {
         // No last-model record — fine, nothing to restore.
+      }
+
+      // First-ever launch: there's no saved settings file yet, so pick
+      // starting values from what this specific phone actually has,
+      // instead of one fixed default that's wrong for both a tight
+      // 8 GB phone and a spacious 16 GB one.
+      if (!hadSavedSettings) {
+        const device = await DocKit.getDeviceInfo();
+        if (device) {
+          const tuned = recommendedSettings(device);
+          setSettings(prev => ({ ...prev, ...tuned }));
+          logEvent('settings_auto_tuned_first_run', tuned);
+        }
       }
     })();
   }, []);
@@ -288,24 +325,22 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
           );
         }
 
-        // A model that plainly won't fit in what's actually free right now
-        // is the single biggest cause of a silent OS-level kill ("the app
-        // just crashes"). Checking live available RAM — not just the
-        // device's total — catches that before it happens, rather than
-        // after.
+        // Weights are mmap'd, so the model file does not need to be fully
+        // resident to load — the kernel pages it in from disk as needed
+        // and can reclaim clean pages under pressure. What actually costs
+        // real, non-swappable RAM is the KV cache (sized by the context
+        // window) plus a modest compute buffer — not the file size. An
+        // earlier version of this check compared the whole file against
+        // free RAM and ended up blocking every model on a tight-memory
+        // phone for no real reason. It's gone; if a load is genuinely
+        // going to fail, the native loader below will say so with a real
+        // error instead of a guess.
         const device = await DocKit.getDeviceInfo();
-        if (device && device.availRamBytes > 0) {
-          const neededBytes = model.sizeBytes * 1.25 + 350 * 1024 * 1024;
-          if (neededBytes > device.availRamBytes) {
-            throw new Error(
-              `Not enough free memory right now: this model needs roughly ${(
-                neededBytes /
-                1024 ** 3
-              ).toFixed(1)} GB but only ${(device.availRamBytes / 1024 ** 3).toFixed(
-                1,
-              )} GB is free. Close other apps, pick a smaller model, or lower the context window in Settings.`,
-            );
-          }
+        if (device && device.availRamBytes > 0 && device.availRamBytes < 300 * 1024 * 1024) {
+          logEvent('load_attempt_low_memory', {
+            modelId: model.id,
+            availRamBytes: device.availRamBytes,
+          });
         }
 
         const ctx = await initLlama(
@@ -403,7 +438,11 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const runCompletion = useCallback(
-    async (history: ChatMessage[], assistantId: string) => {
+    async (
+      history: ChatMessage[],
+      assistantId: string,
+      opts: { extraInstruction?: string; seed?: string } = {},
+    ) => {
       const ctx = contextRef.current;
       if (!ctx) return;
 
@@ -441,7 +480,11 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
           apiMessages.push({ role: m.role, content: parts });
         }
 
-        let accumulated = '';
+        if (opts.extraInstruction) {
+          apiMessages.push({ role: 'user', content: opts.extraInstruction });
+        }
+
+        let accumulated = opts.seed ?? '';
         let tokenCount = 0;
 
         const result = await ctx.completion(
@@ -458,7 +501,9 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
             const { visible, reasoning } = splitReasoning(accumulated);
             setMessages(prev =>
               prev.map(m =>
-                m.id === assistantId ? { ...m, content: visible, reasoning } : m,
+                m.id === assistantId
+                  ? { ...m, content: visible, reasoning, truncated: false }
+                  : m,
               ),
             );
           },
@@ -574,22 +619,21 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
       const msgs = messagesRef.current;
       const idx = msgs.findIndex(m => m.id === messageId);
       if (idx < 0) return;
+      const target = msgs[idx];
+      if (target.role !== 'assistant') return;
 
-      // Continuing is its own turn: the truncated reply stays in the
-      // transcript as-is, and a fresh assistant message picks up after it,
-      // told explicitly to carry straight on rather than restart.
-      const history = [
-        ...msgs.slice(0, idx + 1),
-        {
-          id: nextId(),
-          role: 'user' as const,
-          content:
-            'Continue your previous reply exactly from where it stopped. Do not repeat anything you already said and do not restart from the beginning.',
-        },
-      ];
-      const assistantId = nextId();
-      setMessages([...history, { id: assistantId, role: 'assistant', content: '' }]);
-      await runCompletion(history, assistantId);
+      // Continuing reuses the same bubble rather than opening a new one:
+      // the truncated assistant turn is sent as context, a hidden
+      // instruction asks the model to pick up exactly where it left off,
+      // and new tokens are appended onto the existing content in place —
+      // so a cut-off answer stays one continuous reply instead of
+      // fragmenting across separate chat turns.
+      const history = msgs.slice(0, idx + 1);
+      await runCompletion(history, messageId, {
+        extraInstruction:
+          'Continue your previous reply exactly from where it stopped. Do not repeat anything you already said and do not restart from the beginning.',
+        seed: target.content,
+      });
     },
     [loadState, isGenerating, runCompletion],
   );
@@ -633,6 +677,18 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
     logEvent('settings_reset');
   }, []);
 
+  /** Same tuning logic as first-run, but callable on demand — e.g. after
+   * closing other apps and freeing up memory, or just to get back to a
+   * sane baseline. Returns false if device info wasn't available. */
+  const tuneForDevice = useCallback(async (): Promise<boolean> => {
+    const device = await DocKit.getDeviceInfo();
+    if (!device) return false;
+    const tuned = recommendedSettings(device);
+    setSettings(prev => ({ ...prev, ...tuned }));
+    logEvent('settings_tuned_manual', tuned);
+    return true;
+  }, []);
+
   const value = useMemo<LlamaContextValue>(
     () => ({
       loadState,
@@ -645,6 +701,7 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
       settings,
       updateSettings,
       resetSettings,
+      tuneForDevice,
       loadModel,
       unloadModel,
       sendMessage,
@@ -664,6 +721,7 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
       settings,
       updateSettings,
       resetSettings,
+      tuneForDevice,
       loadModel,
       unloadModel,
       sendMessage,

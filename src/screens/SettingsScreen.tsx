@@ -21,6 +21,7 @@ export default function SettingsScreen() {
     settings,
     updateSettings,
     resetSettings,
+    tuneForDevice,
     activeModel,
     visionEnabled,
     unloadModel,
@@ -59,6 +60,25 @@ export default function SettingsScreen() {
       }}>
       <View style={{ maxWidth: layout.contentWidth, width: '100%', alignSelf: 'center' }}>
         <Text style={styles.title}>Settings</Text>
+
+        <Pressable
+          style={styles.tuneBtn}
+          onPress={async () => {
+            const ok = await tuneForDevice();
+            Alert.alert(
+              ok ? 'Tuned' : 'Could not read device info',
+              ok
+                ? 'Context size, reply length, threads and image detail were set from this phone\u2019s current RAM and core count.'
+                : 'Try again in a moment.',
+            );
+          }}>
+          <Text style={styles.tuneBtnText}>⚙ Tune settings for this device</Text>
+          <Text style={styles.tuneBtnHelp}>
+            Sets context window, threads, reply length and image detail from
+            this phone's actual memory and cores — worth running again after
+            closing other apps, or any time things feel too heavy.
+          </Text>
+        </Pressable>
 
         <Section label="Instructions">
           <Text style={styles.help}>
@@ -363,6 +383,25 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   section: { marginTop: spacing.xl },
+  tuneBtn: {
+    marginTop: spacing.lg,
+    backgroundColor: colors.accentSoft,
+    borderRadius: radius.sm,
+    borderWidth: 1,
+    borderColor: colors.accentMuted,
+    padding: spacing.md,
+  },
+  tuneBtnText: {
+    color: colors.accent,
+    fontSize: fontSizes.sm,
+    fontWeight: '700',
+  },
+  tuneBtnHelp: {
+    color: colors.textSecondary,
+    fontSize: fontSizes.xxs,
+    lineHeight: 16,
+    marginTop: spacing.xs,
+  },
   sectionLabel: {
     color: colors.textFaint,
     fontSize: fontSizes.xxs,

@@ -34,9 +34,14 @@ import { useLlama } from '../context/LlamaContext';
 import ModelListItem from '../components/ModelListItem';
 import { colors, fontSizes, radius, spacing, useLayout } from '../theme';
 
-type Filter = 'all' | ModelTag;
+type Filter = 'all' | 'fits' | ModelTag;
 
-const FILTERS: Filter[] = ['all', 'recommended', 'vision', 'uncensored', 'tiny', 'coding'];
+const FILTERS: Filter[] = ['all', 'fits', 'recommended', 'vision', 'uncensored', 'tiny', 'coding'];
+
+const FILTER_LABELS: Partial<Record<Filter, string>> = {
+  all: 'Everything',
+  fits: 'Fits your phone',
+};
 
 export default function ModelsScreen({ onLoaded }: { onLoaded: () => void }) {
   const { installed, refreshInstalled, activeModel, loadModel } = useLlama();
@@ -83,13 +88,18 @@ export default function ModelsScreen({ onLoaded }: { onLoaded: () => void }) {
     [installed],
   );
 
-  const visible = useMemo(
-    () =>
-      filter === 'all'
-        ? MODEL_CATALOG
-        : MODEL_CATALOG.filter(m => m.tags.includes(filter as ModelTag)),
-    [filter],
-  );
+  // "Fits" uses total RAM with a realistic OS/background-app margin —
+  // available RAM fluctuates turn to turn, but total is stable, so it's
+  // what makes for a sane one-time filter rather than one that changes
+  // its mind every time you open the tab.
+  const visible = useMemo(() => {
+    if (filter === 'all') return MODEL_CATALOG;
+    if (filter === 'fits') {
+      if (deviceRamGiB === undefined) return MODEL_CATALOG;
+      return MODEL_CATALOG.filter(m => m.minRamGiB <= deviceRamGiB - 1.5);
+    }
+    return MODEL_CATALOG.filter(m => m.tags.includes(filter as ModelTag));
+  }, [filter, deviceRamGiB]);
 
   const statusFor = useCallback(
     (id: string) => ({
@@ -293,7 +303,7 @@ export default function ModelsScreen({ onLoaded }: { onLoaded: () => void }) {
             style={[styles.filter, filter === f && styles.filterActive]}>
             <Text
               style={[styles.filterText, filter === f && styles.filterTextActive]}>
-              {f === 'all' ? 'Everything' : TAG_LABELS[f as ModelTag]}
+              {FILTER_LABELS[f] ?? TAG_LABELS[f as ModelTag]}
             </Text>
           </Pressable>
         ))}
