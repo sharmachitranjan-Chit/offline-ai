@@ -11,11 +11,13 @@ export default function MessageBubble({
   maxWidth,
   showReasoning,
   streaming,
+  onContinue,
 }: {
   message: ChatMessage;
   maxWidth: number;
   showReasoning: boolean;
   streaming?: boolean;
+  onContinue?: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const isUser = message.role === 'user';
@@ -63,6 +65,19 @@ export default function MessageBubble({
           <Text style={styles.thinking}>
             {hasReasoning ? 'Thinking…' : 'Generating…'}
           </Text>
+        )}
+
+        {!isUser && message.truncated && !streaming && (
+          <View style={styles.truncatedNotice}>
+            <Text style={styles.truncatedText}>
+              ⚠ Cut off at the length limit, not actually finished.
+            </Text>
+            {!!onContinue && (
+              <Pressable onPress={onContinue} hitSlop={8}>
+                <Text style={styles.truncatedAction}>Continue →</Text>
+              </Pressable>
+            )}
+          </View>
         )}
 
         {!isUser && !!message.content && !streaming && (
@@ -153,5 +168,26 @@ const styles = StyleSheet.create({
     marginTop: spacing.sm,
   },
   action: { color: colors.textFaint, fontSize: fontSizes.xs, fontWeight: '600' },
+  truncatedNotice: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: colors.warningSoft,
+    borderRadius: radius.xs,
+    paddingVertical: spacing.xs,
+    paddingHorizontal: spacing.sm,
+    marginTop: spacing.sm,
+    gap: spacing.sm,
+  },
+  truncatedText: {
+    color: colors.warning,
+    fontSize: fontSizes.xxs,
+    flexShrink: 1,
+  },
+  truncatedAction: {
+    color: colors.warning,
+    fontSize: fontSizes.xxs,
+    fontWeight: '700',
+  },
   stat: { color: colors.textFaint, fontSize: fontSizes.xxs, marginLeft: 'auto' },
 });

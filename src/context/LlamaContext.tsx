@@ -12,6 +12,7 @@ import { initLlama, LlamaContext as LlamaCppContext } from 'llama.rn';
 import { InstalledModel, readRegistry } from '../services/modelManager';
 import { Attachment, planAttachments } from '../services/attachments';
 import { DocKit } from '../native/DocKit';
+import { logEvent } from '../services/diagnostics';
 
 export type ChatRole = 'system' | 'user' | 'assistant';
 
@@ -25,6 +26,12 @@ export type ChatMessage = {
   error?: boolean;
   /** Tokens per second for the completed turn. */
   tps?: number;
+  /**
+   * Set when generation stopped because it hit the reply-length limit or
+   * ran out of context, rather than because the model actually finished.
+   * The content is real, just cut off mid-thought.
+   */
+  truncated?: boolean;
 };
 
 export type LoadState =
@@ -52,7 +59,12 @@ export const DEFAULT_SETTINGS: Settings = {
     'You are a capable assistant running entirely on this device. Answer directly and completely. When the user attaches an image or a document, examine it carefully and ground your answer in what is actually there.',
   temperature: 0.7,
   topP: 0.9,
-  maxTokens: 1024,
+  // 1024 sounds generous until you ask for a full C++ or Python file —
+  // that's routinely 1500-3000+ tokens, so the old default cut real
+  // answers off mid-function. 2048 is a better balance of "long code still
+  // fits" against "reply time on a phone stays reasonable"; the stepper in
+  // Settings still lets it go higher for anyone who wants that trade-off.
+  maxTokens: 2048,
   threads: 4,
   contextSize: 8192,
   imageMaxTokens: 512,
@@ -63,6 +75,30 @@ export const DEFAULT_SETTINGS: Settings = {
 
 const SETTINGS_PATH = `${RNFS.DocumentDirectoryPath}/settings.json`;
 const CHAT_PATH = `${RNFS.DocumentDirectoryPath}/conversation.json`;
+const LAST_MODEL_PATH = `${RNFS.DocumentDirectoryPath}/last_model.json`;
+const ARCHIVE_DIR = `${RNFS.DocumentDirectoryPath}/conversations`;
+
+/** How long the vision projector gets to initialize before we give up on
+ * it rather than let a hang leave the whole app stuck on the loading
+ * screen (which is what "the composer never opens for image models" turns
+ * out to be — vision init that never resolves). */
+const MULTIMODAL_INIT_TIMEOUT_MS = 45_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out`)), ms);
+    promise.then(
+      v => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      e => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
 
 type LlamaContextValue = {
   loadState: LoadState;
@@ -74,10 +110,12 @@ type LlamaContextValue = {
   messages: ChatMessage[];
   settings: Settings;
   updateSettings: (patch: Partial<Settings>) => void;
+  resetSettings: () => void;
   loadModel: (installed: InstalledModel) => Promise<void>;
   unloadModel: () => Promise<void>;
   sendMessage: (text: string, attachments?: Attachment[]) => Promise<void>;
   regenerate: () => Promise<void>;
+  continueReply: (messageId: string) => Promise<void>;
   stopGenerating: () => void;
   resetChat: () => void;
 };
@@ -127,6 +165,7 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
   const stopRequested = useRef(false);
   const messagesRef = useRef<ChatMessage[]>([]);
   messagesRef.current = messages;
+  const pendingAutoLoad = useRef<InstalledModel | null>(null);
 
   // ---- persistence -------------------------------------------------
 
@@ -148,7 +187,27 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
       } catch {
         // Same.
       }
-      setInstalled(await readRegistry());
+      const registry = await readRegistry();
+      setInstalled(registry);
+
+      // Restore whichever model was active last time, so closing and
+      // reopening the app (or the OS reclaiming the Activity) doesn't mean
+      // reselecting it by hand every single time.
+      try {
+        if (await RNFS.exists(LAST_MODEL_PATH)) {
+          const { modelId } = JSON.parse(
+            await RNFS.readFile(LAST_MODEL_PATH, 'utf8'),
+          );
+          const match = registry.find(m => m.id === modelId);
+          if (match) {
+            logEvent('auto_restore_model', { modelId });
+            // loadModelRef is assigned further down, once defined.
+            pendingAutoLoad.current = match;
+          }
+        }
+      } catch {
+        // No last-model record — fine, nothing to restore.
+      }
     })();
   }, []);
 
@@ -200,6 +259,10 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
     await releaseContext();
     setActiveModel(undefined);
     setLoadState({ status: 'idle' });
+    // An explicit unload is a decision, not a crash — don't reload this
+    // model automatically next launch.
+    RNFS.unlink(LAST_MODEL_PATH).catch(() => {});
+    logEvent('model_unloaded');
   }, [releaseContext]);
 
   const loadModel = useCallback(
@@ -216,12 +279,33 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
         progress: 0,
         stage: 'Reading weights',
       });
+      logEvent('model_load_start', { modelId: model.id, sizeBytes: model.sizeBytes });
 
       try {
         if (!(await RNFS.exists(model.path))) {
           throw new Error(
             'The model file is no longer at its saved location. Re-import it from the Models tab.',
           );
+        }
+
+        // A model that plainly won't fit in what's actually free right now
+        // is the single biggest cause of a silent OS-level kill ("the app
+        // just crashes"). Checking live available RAM — not just the
+        // device's total — catches that before it happens, rather than
+        // after.
+        const device = await DocKit.getDeviceInfo();
+        if (device && device.availRamBytes > 0) {
+          const neededBytes = model.sizeBytes * 1.25 + 350 * 1024 * 1024;
+          if (neededBytes > device.availRamBytes) {
+            throw new Error(
+              `Not enough free memory right now: this model needs roughly ${(
+                neededBytes /
+                1024 ** 3
+              ).toFixed(1)} GB but only ${(device.availRamBytes / 1024 ** 3).toFixed(
+                1,
+              )} GB is free. Close other apps, pick a smaller model, or lower the context window in Settings.`,
+            );
+          }
         }
 
         const ctx = await initLlama(
@@ -253,21 +337,40 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
             stage: 'Starting vision encoder',
           });
           try {
-            await ctx.initMultimodal({
-              path: model.mmprojPath,
-              use_gpu: false,
-              image_max_tokens: settings.imageMaxTokens,
-            });
+            // Wrapped in a timeout: a projector that hangs (rather than
+            // errors) used to leave the whole app parked on the loading
+            // screen forever — which looked, from the chat tab, exactly
+            // like "the composer never opens" for vision models.
+            await withTimeout(
+              ctx.initMultimodal({
+                path: model.mmprojPath,
+                use_gpu: false,
+                image_max_tokens: settings.imageMaxTokens,
+              }),
+              MULTIMODAL_INIT_TIMEOUT_MS,
+              'Vision encoder init',
+            );
             const support = await ctx.getMultimodalSupport();
             vision = !!support?.vision;
-          } catch {
-            // A bad projector shouldn't cost you the text model too.
+          } catch (mmErr: any) {
+            // A bad or slow projector shouldn't cost you the text model too.
             vision = false;
+            logEvent('multimodal_init_failed', {
+              modelId: model.id,
+              message: mmErr?.message,
+            });
           }
         }
 
         setVisionEnabled(vision);
         setLoadState({ status: 'ready', modelId: model.id, vision });
+        logEvent('model_load_ready', { modelId: model.id, vision });
+
+        RNFS.writeFile(
+          LAST_MODEL_PATH,
+          JSON.stringify({ modelId: model.id }),
+          'utf8',
+        ).catch(() => {});
       } catch (err: any) {
         await releaseContext();
         setLoadState({
@@ -275,10 +378,22 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
           modelId: model.id,
           message: err?.message ?? 'Failed to load this model.',
         });
+        logEvent('model_load_failed', { modelId: model.id, message: err?.message });
       }
     },
     [releaseContext, settings.contextSize, settings.threads, settings.imageMaxTokens],
   );
+
+  // Fires once the registry has loaded and a previously-active model was
+  // found (see the persistence effect above). Deferred to its own effect
+  // so it always runs against the latest `loadModel` closure.
+  useEffect(() => {
+    if (pendingAutoLoad.current) {
+      const model = pendingAutoLoad.current;
+      pendingAutoLoad.current = null;
+      loadModel(model);
+    }
+  }, [installed, loadModel]);
 
   // ---- generation ---------------------------------------------------
 
@@ -329,7 +444,7 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
         let accumulated = '';
         let tokenCount = 0;
 
-        await ctx.completion(
+        const result = await ctx.completion(
           {
             messages: apiMessages,
             n_predict: settings.maxTokens,
@@ -351,10 +466,27 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
 
         const seconds = (Date.now() - startedAt) / 1000;
         const tps = seconds > 0 ? tokenCount / seconds : undefined;
+        // The reply is genuinely cut off (not just done) when it stopped
+        // because it ran into the length cap or the context window, rather
+        // than because the model reached a natural end. Surfacing that
+        // beats a big C++ file that just silently stops mid-function.
+        const truncated =
+          !stopRequested.current &&
+          !result?.interrupted &&
+          !result?.stopped_eos &&
+          !result?.stopped_word &&
+          (!!result?.stopped_limit || !!result?.context_full);
         setMessages(prev =>
-          prev.map(m => (m.id === assistantId ? { ...m, tps } : m)),
+          prev.map(m => (m.id === assistantId ? { ...m, tps, truncated } : m)),
         );
+        if (truncated) {
+          logEvent('reply_truncated', {
+            maxTokens: settings.maxTokens,
+            contextFull: !!result?.context_full,
+          });
+        }
       } catch (err: any) {
+        logEvent('generation_error', { message: err?.message });
         setMessages(prev =>
           prev.map(m =>
             m.id === assistantId
@@ -436,9 +568,69 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
     await runCompletion(history, assistantId);
   }, [loadState, isGenerating, runCompletion]);
 
+  const continueReply = useCallback(
+    async (messageId: string) => {
+      if (loadState.status !== 'ready' || isGenerating) return;
+      const msgs = messagesRef.current;
+      const idx = msgs.findIndex(m => m.id === messageId);
+      if (idx < 0) return;
+
+      // Continuing is its own turn: the truncated reply stays in the
+      // transcript as-is, and a fresh assistant message picks up after it,
+      // told explicitly to carry straight on rather than restart.
+      const history = [
+        ...msgs.slice(0, idx + 1),
+        {
+          id: nextId(),
+          role: 'user' as const,
+          content:
+            'Continue your previous reply exactly from where it stopped. Do not repeat anything you already said and do not restart from the beginning.',
+        },
+      ];
+      const assistantId = nextId();
+      setMessages([...history, { id: assistantId, role: 'assistant', content: '' }]);
+      await runCompletion(history, assistantId);
+    },
+    [loadState, isGenerating, runCompletion],
+  );
+
   const resetChat = useCallback(() => {
+    const outgoing = messagesRef.current;
     setMessages([]);
-    contextRef.current?.clearCache?.(false).catch(() => {});
+
+    // Overwrite immediately rather than waiting for the debounced autosave
+    // — otherwise a crash in the next second or two brings the "cleared"
+    // conversation right back on relaunch.
+    RNFS.writeFile(CHAT_PATH, JSON.stringify([]), 'utf8').catch(() => {});
+
+    // Archive what was there rather than just discarding it, so "start a
+    // new chat" doesn't mean the previous conversation is gone for good.
+    if (outgoing.length > 0) {
+      RNFS.mkdir(ARCHIVE_DIR)
+        .catch(() => {})
+        .finally(() => {
+          RNFS.writeFile(
+            `${ARCHIVE_DIR}/session-${Date.now()}.json`,
+            JSON.stringify(outgoing),
+            'utf8',
+          ).catch(() => {});
+        });
+    }
+
+    // Actually clear the model's own KV cache — a `?.()` that silently
+    // swallows its result meant a failed clear left old turns bleeding
+    // into the "new" conversation with no sign anything had gone wrong.
+    contextRef.current
+      ?.clearCache?.(true)
+      ?.then(() => logEvent('chat_reset'))
+      ?.catch((err: any) =>
+        logEvent('chat_reset_cache_clear_failed', { message: err?.message }),
+      );
+  }, []);
+
+  const resetSettings = useCallback(() => {
+    setSettings(DEFAULT_SETTINGS);
+    logEvent('settings_reset');
   }, []);
 
   const value = useMemo<LlamaContextValue>(
@@ -452,10 +644,12 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
       messages,
       settings,
       updateSettings,
+      resetSettings,
       loadModel,
       unloadModel,
       sendMessage,
       regenerate,
+      continueReply,
       stopGenerating,
       resetChat,
     }),
@@ -469,10 +663,12 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
       messages,
       settings,
       updateSettings,
+      resetSettings,
       loadModel,
       unloadModel,
       sendMessage,
       regenerate,
+      continueReply,
       stopGenerating,
       resetChat,
     ],

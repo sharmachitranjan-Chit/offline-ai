@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import {
+  Alert,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -9,21 +10,44 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { DEFAULT_SETTINGS, useLlama } from '../context/LlamaContext';
+import { useLlama } from '../context/LlamaContext';
 import { DeviceInfo, DocKit } from '../native/DocKit';
 import { formatBytes } from '../services/modelManager';
+import { clearLog, readLog } from '../services/diagnostics';
 import { colors, fontSizes, radius, spacing, useLayout } from '../theme';
 
 export default function SettingsScreen() {
-  const { settings, updateSettings, activeModel, visionEnabled, unloadModel } =
-    useLlama();
+  const {
+    settings,
+    updateSettings,
+    resetSettings,
+    activeModel,
+    visionEnabled,
+    unloadModel,
+  } = useLlama();
   const insets = useSafeAreaInsets();
   const layout = useLayout();
   const [device, setDevice] = useState<DeviceInfo | null>(null);
   const [prompt, setPrompt] = useState(settings.systemPrompt);
+  const [logPreview, setLogPreview] = useState('');
 
   useEffect(() => {
     DocKit.getDeviceInfo().then(setDevice);
+  }, []);
+
+  useEffect(() => {
+    setPrompt(settings.systemPrompt);
+  }, [settings.systemPrompt]);
+
+  const refreshLogPreview = () => {
+    readLog().then(text => {
+      const lines = text.trim().split('\n');
+      setLogPreview(lines.slice(-12).join('\n'));
+    });
+  };
+
+  useEffect(() => {
+    refreshLogPreview();
   }, []);
 
   return (
@@ -51,13 +75,6 @@ export default function SettingsScreen() {
             placeholder="System prompt"
             placeholderTextColor={colors.textFaint}
           />
-          <Pressable
-            onPress={() => {
-              setPrompt(DEFAULT_SETTINGS.systemPrompt);
-              updateSettings({ systemPrompt: DEFAULT_SETTINGS.systemPrompt });
-            }}>
-            <Text style={styles.link}>Reset to default</Text>
-          </Pressable>
         </Section>
 
         <Section label="Generation">
@@ -87,7 +104,7 @@ export default function SettingsScreen() {
             value={settings.maxTokens}
             step={256}
             min={256}
-            max={4096}
+            max={8192}
             format={v => `${v}`}
             onChange={v => updateSettings({ maxTokens: v })}
           />
@@ -171,6 +188,71 @@ export default function SettingsScreen() {
             </Pressable>
           )}
         </Section>
+
+        <Section label="Diagnostics">
+          <Text style={styles.help}>
+            A running log of loads, generations, and errors — kept locally so
+            a crash or a stuck screen can be diagnosed from evidence instead
+            of a guess. Nothing here ever leaves the device.
+          </Text>
+          <View style={styles.logBox}>
+            <Text style={styles.logText} numberOfLines={14}>
+              {logPreview || 'Nothing logged yet.'}
+            </Text>
+          </View>
+          <View style={styles.diagRow}>
+            <Pressable
+              style={styles.diagBtn}
+              onPress={async () => {
+                const full = await readLog();
+                DocKit.setClipboard(full);
+                Alert.alert('Copied', 'The full diagnostics log is on your clipboard.');
+              }}>
+              <Text style={styles.diagBtnText}>Copy full log</Text>
+            </Pressable>
+            <Pressable
+              style={styles.diagBtn}
+              onPress={refreshLogPreview}>
+              <Text style={styles.diagBtnText}>Refresh</Text>
+            </Pressable>
+            <Pressable
+              style={styles.diagBtn}
+              onPress={() =>
+                Alert.alert('Clear diagnostics log?', undefined, [
+                  { text: 'Cancel', style: 'cancel' },
+                  {
+                    text: 'Clear',
+                    style: 'destructive',
+                    onPress: async () => {
+                      await clearLog();
+                      refreshLogPreview();
+                    },
+                  },
+                ])
+              }>
+              <Text style={styles.diagBtnText}>Clear</Text>
+            </Pressable>
+          </View>
+        </Section>
+
+        <Pressable
+          style={styles.resetAllBtn}
+          onPress={() =>
+            Alert.alert(
+              'Reset all settings?',
+              'This puts every value on this screen back to its default. Your models and conversation are not affected.',
+              [
+                { text: 'Cancel', style: 'cancel' },
+                {
+                  text: 'Reset',
+                  style: 'destructive',
+                  onPress: () => resetSettings(),
+                },
+              ],
+            )
+          }>
+          <Text style={styles.resetAllText}>Reset all settings to default</Text>
+        </Pressable>
 
         <Text style={styles.footer}>
           No account, no telemetry, no network calls during inference. The only
@@ -365,6 +447,38 @@ const styles = StyleSheet.create({
     flexShrink: 1,
     textAlign: 'right',
   },
+  logBox: {
+    backgroundColor: colors.code,
+    borderRadius: radius.sm,
+    borderWidth: 1,
+    borderColor: colors.borderSoft,
+    padding: spacing.md,
+    marginTop: spacing.sm,
+  },
+  logText: {
+    color: colors.textSecondary,
+    fontSize: fontSizes.xxs,
+    lineHeight: 15,
+    fontFamily: 'monospace',
+  },
+  diagRow: { flexDirection: 'row', gap: spacing.sm, marginTop: spacing.sm },
+  diagBtn: {
+    backgroundColor: colors.surfaceHigh,
+    borderRadius: radius.sm,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+  },
+  diagBtnText: { color: colors.textPrimary, fontSize: fontSizes.xs, fontWeight: '600' },
+  resetAllBtn: {
+    marginTop: spacing.xl,
+    backgroundColor: colors.surface,
+    borderRadius: radius.sm,
+    borderWidth: 1,
+    borderColor: colors.borderSoft,
+    padding: spacing.md,
+    alignItems: 'center',
+  },
+  resetAllText: { color: colors.textSecondary, fontSize: fontSizes.sm, fontWeight: '600' },
   unload: {
     marginTop: spacing.md,
     backgroundColor: colors.dangerSoft,

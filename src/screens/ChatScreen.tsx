@@ -34,6 +34,7 @@ export default function ChatScreen({
     sendMessage,
     stopGenerating,
     regenerate,
+    continueReply,
     resetChat,
   } = useLlama();
 
@@ -173,6 +174,11 @@ export default function ChatScreen({
             maxWidth={layout.bubbleMaxWidth}
             showReasoning={settings.showReasoning}
             streaming={isGenerating && index === messages.length - 1}
+            onContinue={
+              item.truncated && !isGenerating
+                ? () => continueReply(item.id)
+                : undefined
+            }
           />
         )}
         ListEmptyComponent={
