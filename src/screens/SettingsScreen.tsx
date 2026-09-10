@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Pressable, ScrollView, Switch, Text, TextInput, View } from 'react-native';
+import { Alert, Pressable, ScrollView, Switch, Text, TextInput, View } from 'react-native';
 import Icon, { IconName } from '../components/Icon';
 import StorageCard from '../components/StorageCard';
 import TopBar from '../components/TopBar';
@@ -7,6 +7,7 @@ import { DEFAULT_SETTINGS, useLlama } from '../context/LlamaContext';
 import { ThemeMode, makeStyles, useColors, useTheme } from '../context/ThemeContext';
 import { DeviceInfo, DocKit } from '../native/DocKit';
 import { formatBytes } from '../services/modelManager';
+import { clearLog, readLog } from '../services/diagnostics';
 import { fontSizes, radius, spacing, useLayout } from '../theme';
 
 const APPEARANCE: Array<{ mode: ThemeMode; label: string; icon: IconName }> = [
@@ -19,6 +20,8 @@ export default function SettingsScreen({ onBack }: { onBack: () => void }) {
   const {
     settings,
     updateSettings,
+    resetSettings,
+    tuneForDevice,
     activeModel,
     visionEnabled,
     unloadModel,
@@ -30,6 +33,18 @@ export default function SettingsScreen({ onBack }: { onBack: () => void }) {
   const layout = useLayout();
   const [device, setDevice] = useState<DeviceInfo | null>(null);
   const [prompt, setPrompt] = useState(settings.systemPrompt);
+  const [logPreview, setLogPreview] = useState('');
+
+  const refreshLogPreview = () => {
+    readLog().then(text => {
+      const lines = text.trim().split('\n');
+      setLogPreview(lines.slice(-12).join('\n'));
+    });
+  };
+
+  useEffect(() => {
+    refreshLogPreview();
+  }, []);
 
   useEffect(() => {
     DocKit.getDeviceInfo().then(setDevice);
@@ -114,6 +129,29 @@ export default function SettingsScreen({ onBack }: { onBack: () => void }) {
             </View>
           </Section>
 
+          <Section label="Tuning">
+            <Pressable
+              style={styles.field}
+              onPress={async () => {
+                const ok = await tuneForDevice();
+                if (ok) DocKit.getDeviceInfo().then(setDevice);
+                Alert.alert(
+                  ok ? 'Tuned for this phone' : 'Could not read device info',
+                  ok
+                    ? 'Context window, reply length, threads and image detail were set from current free RAM and core count. Context changes apply on the next model load.'
+                    : 'Try again in a moment.',
+                );
+              }}>
+              <Text style={[styles.fieldLabel, { color: c.accent }]}>
+                Tune settings for this device
+              </Text>
+              <Text style={styles.help}>
+                Worth running again after closing other apps, or any time
+                things feel too heavy or the phone gets warm.
+              </Text>
+            </Pressable>
+          </Section>
+
           <Section label="Generation">
             <Stepper
               label="Temperature"
@@ -141,7 +179,7 @@ export default function SettingsScreen({ onBack }: { onBack: () => void }) {
               value={settings.maxTokens}
               step={256}
               min={256}
-              max={4096}
+              max={8192}
               format={v => `${v}`}
               onChange={v => updateSettings({ maxTokens: v })}
             />
@@ -249,6 +287,66 @@ export default function SettingsScreen({ onBack }: { onBack: () => void }) {
               )}
             </View>
           </Section>
+
+          <Section label="Diagnostics">
+            <View style={styles.field}>
+              <Text style={styles.help}>
+                A local log of loads, generations and errors, so a crash or a
+                stuck screen can be diagnosed from evidence. It never leaves the
+                phone unless you copy it out.
+              </Text>
+              <View style={styles.logBox}>
+                <Text style={styles.logText} numberOfLines={14} selectable>
+                  {logPreview || 'Nothing logged yet.'}
+                </Text>
+              </View>
+              <View style={styles.diagRow}>
+                <Pressable
+                  style={styles.diagBtn}
+                  onPress={async () => {
+                    DocKit.setClipboard(await readLog());
+                    Alert.alert('Copied', 'The full diagnostics log is on your clipboard.');
+                  }}>
+                  <Text style={styles.diagBtnText}>Copy full log</Text>
+                </Pressable>
+                <Pressable style={styles.diagBtn} onPress={refreshLogPreview}>
+                  <Text style={styles.diagBtnText}>Refresh</Text>
+                </Pressable>
+                <Pressable
+                  style={styles.diagBtn}
+                  onPress={() =>
+                    Alert.alert('Clear diagnostics log?', undefined, [
+                      { text: 'Cancel', style: 'cancel' },
+                      {
+                        text: 'Clear',
+                        style: 'destructive',
+                        onPress: async () => {
+                          await clearLog();
+                          refreshLogPreview();
+                        },
+                      },
+                    ])
+                  }>
+                  <Text style={styles.diagBtnText}>Clear</Text>
+                </Pressable>
+              </View>
+            </View>
+          </Section>
+
+          <Pressable
+            style={styles.unload}
+            onPress={() =>
+              Alert.alert(
+                'Reset all settings?',
+                'Every value on this screen goes back to its default. Models, chats and the models folder are not affected.',
+                [
+                  { text: 'Cancel', style: 'cancel' },
+                  { text: 'Reset', style: 'destructive', onPress: resetSettings },
+                ],
+              )
+            }>
+            <Text style={styles.unloadText}>Reset all settings to default</Text>
+          </Pressable>
 
           <Text style={styles.footer}>
             No account, no telemetry, no network calls during inference. The only
@@ -474,6 +572,29 @@ const useStyles = makeStyles(c => ({
     alignItems: 'center',
   },
   unloadText: { color: c.danger, fontSize: fontSizes.sm, fontWeight: '600' },
+  logBox: {
+    backgroundColor: c.code,
+    borderRadius: radius.sm,
+    borderWidth: 1,
+    borderColor: c.borderSoft,
+    padding: spacing.sm,
+    marginTop: spacing.md,
+  },
+  logText: {
+    color: c.textSecondary,
+    fontSize: 10,
+    lineHeight: 14,
+    fontFamily: 'monospace',
+  },
+  diagRow: { flexDirection: 'row', gap: spacing.sm, marginTop: spacing.md },
+  diagBtn: {
+    flex: 1,
+    backgroundColor: c.surfaceHigh,
+    borderRadius: radius.sm,
+    paddingVertical: spacing.sm,
+    alignItems: 'center',
+  },
+  diagBtnText: { color: c.textPrimary, fontSize: fontSizes.xs, fontWeight: '600' },
   footer: {
     color: c.textFaint,
     fontSize: fontSizes.xs,

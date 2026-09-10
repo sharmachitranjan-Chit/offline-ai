@@ -50,6 +50,7 @@ export default function ChatScreen({
     editMessage,
     stopGenerating,
     regenerate,
+    continueReply,
     newChat,
     loadModel,
   } = useLlama();
@@ -260,6 +261,11 @@ export default function ChatScreen({
               streaming={isGenerating && index === messages.length - 1}
               onRetry={
                 index === messages.length - 1 && !isGenerating ? regenerate : undefined
+              }
+              onContinue={
+                item.truncated && !isGenerating
+                  ? () => continueReply(item.id)
+                  : undefined
               }
               onEdit={
                 item.role === 'user' && !isGenerating

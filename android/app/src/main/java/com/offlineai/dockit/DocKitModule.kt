@@ -855,8 +855,20 @@ class DocKitModule(private val ctx: ReactApplicationContext) :
                     promise.reject("missing", "$from is not there any more."); return@execute
                 }
                 val dest = File(to)
+                // /sdcard/X and /storage/emulated/0/X are the same file; deleting
+                // "the destination" first would delete the only copy.
+                if (src.canonicalPath == dest.canonicalPath) {
+                    promise.resolve(dest.absolutePath); return@execute
+                }
                 dest.parentFile?.mkdirs()
-                if (dest.exists()) dest.delete()
+                if (dest.exists()) {
+                    if (dest.length() == src.length()) {
+                        // Already there (e.g. an earlier move that was interrupted).
+                        src.delete()
+                        promise.resolve(dest.absolutePath); return@execute
+                    }
+                    dest.delete()
+                }
                 if (src.renameTo(dest)) {
                     promise.resolve(dest.absolutePath); return@execute
                 }

@@ -26,6 +26,8 @@ export type ChatMessage = {
   error?: boolean;
   /** Tokens per second for the completed turn. */
   tps?: number;
+  /** Stopped at the reply-length limit or a full context, not a natural end. */
+  truncated?: boolean;
   createdAt?: number;
 };
 
@@ -42,6 +44,8 @@ export type Conversation = {
 const CHATS_PATH = `${RNFS.DocumentDirectoryPath}/chats.json`;
 /** Where the single conversation lived before there were many. */
 const LEGACY_CHAT_PATH = `${RNFS.DocumentDirectoryPath}/conversation.json`;
+/** Where the pre-2.1 builds archived a chat when "New chat" was pressed. */
+const LEGACY_ARCHIVE_DIR = `${RNFS.DocumentDirectoryPath}/conversations`;
 
 const MAX_CONVERSATIONS = 200;
 const MAX_MESSAGES_PER_CONVERSATION = 400;
@@ -84,19 +88,39 @@ export async function loadConversations(): Promise<Conversation[]> {
           .sort((a, b) => b.updatedAt - a.updatedAt);
       }
     }
-    // One-time upgrade from the single-conversation format.
-    if (await RNFS.exists(LEGACY_CHAT_PATH)) {
-      const legacy = JSON.parse(await RNFS.readFile(LEGACY_CHAT_PATH, 'utf8'));
-      if (Array.isArray(legacy) && legacy.length) {
-        const conv: Conversation = {
-          ...emptyConversation(),
-          title: deriveTitle(legacy) ?? 'Earlier chat',
-          messages: legacy,
-        };
-        await saveConversations([conv]);
-        await RNFS.unlink(LEGACY_CHAT_PATH).catch(() => {});
-        return [conv];
+    // One-time upgrade from the single-conversation format: the live chat,
+    // plus any chats archived by "New chat" in those builds.
+    const upgraded: Conversation[] = [];
+    const fromLegacy = (messages: unknown, at: number): void => {
+      if (!Array.isArray(messages) || !messages.length) return;
+      upgraded.push({
+        ...emptyConversation(),
+        createdAt: at,
+        updatedAt: at,
+        title: deriveTitle(messages as ChatMessage[]) ?? 'Earlier chat',
+        messages: messages as ChatMessage[],
+      });
+    };
+    if (await RNFS.exists(LEGACY_ARCHIVE_DIR)) {
+      for (const f of await RNFS.readDir(LEGACY_ARCHIVE_DIR)) {
+        const m = f.name.match(/^session-(\d+)\.json$/);
+        if (!m) continue;
+        try {
+          fromLegacy(JSON.parse(await RNFS.readFile(f.path, 'utf8')), Number(m[1]));
+        } catch {
+          // Skip an unreadable archive rather than lose the rest.
+        }
       }
+    }
+    if (await RNFS.exists(LEGACY_CHAT_PATH)) {
+      fromLegacy(JSON.parse(await RNFS.readFile(LEGACY_CHAT_PATH, 'utf8')), Date.now());
+    }
+    if (upgraded.length) {
+      upgraded.sort((a, b) => b.updatedAt - a.updatedAt);
+      await saveConversations(upgraded);
+      await RNFS.unlink(LEGACY_CHAT_PATH).catch(() => {});
+      await RNFS.unlink(LEGACY_ARCHIVE_DIR).catch(() => {});
+      return upgraded;
     }
   } catch {
     // A corrupt history file should cost the history, not the app.

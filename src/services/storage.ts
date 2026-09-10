@@ -21,6 +21,9 @@ import { DocKit, StorageOption } from '../native/DocKit';
 
 const PREF_PATH = `${RNFS.DocumentDirectoryPath}/storage.json`;
 
+/** Projectors published under a generic name (kept in sync with modelManager). */
+const GENERIC_MMPROJ = /^mmproj[-_.]?(model)?[-_.]?(f16|f32|bf16|q8_0|fp16)?\.gguf$/i;
+
 /** The pre-2.1 location, kept so old installs can be migrated out of it. */
 export const LEGACY_MODELS_DIR = `${RNFS.DocumentDirectoryPath}/models`;
 
@@ -150,6 +153,8 @@ export type MigrationProgress = {
 
 export type MigrationResult = {
   moved: string[];
+  /** Exact old → new paths, so the registry can follow renamed files. */
+  moves: Array<{ from: string; to: string }>;
   failed: Array<{ file: string; message: string }>;
 };
 
@@ -166,7 +171,7 @@ export async function migrateModels(
   to: string,
   onProgress?: (p: MigrationProgress) => void,
 ): Promise<MigrationResult> {
-  const result: MigrationResult = { moved: [], failed: [] };
+  const result: MigrationResult = { moved: [], moves: [], failed: [] };
   if (from === to) return result;
 
   const files = await DocKit.listGguf(from);
@@ -174,6 +179,7 @@ export async function migrateModels(
   if (!check.ok) {
     return {
       moved: [],
+      moves: [],
       failed: files.map(f => ({
         file: f.name,
         message: check.message ?? 'Destination not writable.',
@@ -185,8 +191,20 @@ export async function migrateModels(
     const f = files[i];
     onProgress?.({ file: f.name, index: i, total: files.length });
     try {
-      await DocKit.moveFile(f.path, `${to}/${f.name}`);
+      // Pre-2.1 files were stored as `<modelId>__<published name>`. In a
+      // shared folder the published name is what other apps recognise, so
+      // it's restored on the way out — unless something already has it.
+      let name = f.name;
+      const legacy = from === LEGACY_MODELS_DIR ? f.name.match(/^(.+?)__(.+\.gguf)$/i) : null;
+      if (legacy) {
+        const [, modelId, published] = legacy;
+        const clean = GENERIC_MMPROJ.test(published) ? `${modelId}-${published}` : published;
+        if (!(await RNFS.exists(`${to}/${clean}`))) name = clean;
+      }
+      const dest = `${to}/${name}`;
+      await DocKit.moveFile(f.path, dest);
       result.moved.push(f.name);
+      result.moves.push({ from: f.path, to: dest });
     } catch (e: any) {
       result.failed.push({
         file: f.name,

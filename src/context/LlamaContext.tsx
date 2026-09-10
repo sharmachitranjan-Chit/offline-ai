@@ -25,6 +25,7 @@ import {
   saveConversations,
 } from '../services/conversations';
 import { DocKit } from '../native/DocKit';
+import { logEvent } from '../services/diagnostics';
 
 export type { ChatMessage, ChatRole } from '../services/conversations';
 
@@ -59,7 +60,9 @@ export const DEFAULT_SETTINGS: Settings = {
     'You are a capable assistant running entirely on this device. Answer directly and completely. When the user attaches an image or a document, examine it carefully and ground your answer in what is actually there.',
   temperature: 0.7,
   topP: 0.9,
-  maxTokens: 1024,
+  // 1024 cuts a full code file off mid-function; 2048 fits long code while
+  // keeping reply time on a phone reasonable.
+  maxTokens: 2048,
   threads: 4,
   contextSize: 8192,
   imageMaxTokens: 512,
@@ -71,6 +74,44 @@ export const DEFAULT_SETTINGS: Settings = {
 };
 
 const SETTINGS_PATH = `${RNFS.DocumentDirectoryPath}/settings.json`;
+
+/** How long the vision projector gets to initialise before it is abandoned,
+ * so a hang (rather than an error) can't park the app on the loading screen. */
+const MULTIMODAL_INIT_TIMEOUT_MS = 45_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out`)), ms);
+    promise.then(
+      v => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      e => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
+/**
+ * Generation settings from what the phone actually reports. Context size
+ * drives the KV cache (real, non-swappable RAM) and more threads stop helping
+ * past the efficiency cores, so both scale with available memory and cores.
+ */
+export function recommendedSettings(device: {
+  totalRamBytes: number;
+  availRamBytes: number;
+  cores: number;
+}): Pick<Settings, 'contextSize' | 'maxTokens' | 'threads' | 'imageMaxTokens'> {
+  const availGiB = device.availRamBytes / 1024 ** 3;
+  const contextSize = availGiB < 2 ? 2048 : availGiB < 3.5 ? 4096 : availGiB < 6 ? 6144 : 8192;
+  const maxTokens = availGiB < 2 ? 1024 : availGiB < 3.5 ? 1536 : 2048;
+  const threads = Math.max(2, Math.min(6, Math.round(device.cores / 2)));
+  const imageMaxTokens = availGiB < 3 ? 256 : 512;
+  return { contextSize, maxTokens, threads, imageMaxTokens };
+}
 
 type LlamaContextValue = {
   loadState: LoadState;
@@ -91,12 +132,18 @@ type LlamaContextValue = {
 
   settings: Settings;
   updateSettings: (patch: Partial<Settings>) => void;
+  /** Everything back to defaults (keeps the remembered model). */
+  resetSettings: () => void;
+  /** Re-derives context/threads/reply length/image detail from this phone. */
+  tuneForDevice: () => Promise<boolean>;
   loadModel: (installed: InstalledModel) => Promise<void>;
   unloadModel: () => Promise<void>;
   sendMessage: (text: string, attachments?: Attachment[]) => Promise<void>;
   /** Replaces a user turn and re-runs everything after it. */
   editMessage: (id: string, text: string) => Promise<void>;
   regenerate: () => Promise<void>;
+  /** Picks a cut-off reply up where it stopped, in the same bubble. */
+  continueReply: (messageId: string) => Promise<void>;
   stopGenerating: () => void;
 };
 
@@ -151,6 +198,8 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
   activeIdRef.current = activeId;
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+  const isGeneratingRef = useRef(false);
+  isGeneratingRef.current = isGenerating;
 
   const activeConversation = useMemo(
     () => conversations.find(c => c.id === activeId),
@@ -167,13 +216,26 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
     let cancelled = false;
     (async () => {
       let loaded = DEFAULT_SETTINGS;
+      let hadSavedSettings = false;
       try {
         if (await RNFS.exists(SETTINGS_PATH)) {
+          hadSavedSettings = true;
           const saved = JSON.parse(await RNFS.readFile(SETTINGS_PATH, 'utf8'));
           loaded = { ...DEFAULT_SETTINGS, ...saved };
         }
       } catch {
         // Corrupt settings shouldn't stop the app from opening.
+      }
+      if (cancelled) return;
+      // First launch: start from what this phone actually has rather than
+      // one fixed default that's wrong for both tight and roomy devices.
+      if (!hadSavedSettings) {
+        const device = await DocKit.getDeviceInfo();
+        if (device) {
+          const tuned = recommendedSettings(device);
+          loaded = { ...loaded, ...tuned };
+          logEvent('settings_auto_tuned_first_run', tuned);
+        }
       }
       if (cancelled) return;
       setSettings(loaded);
@@ -195,9 +257,27 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
       if (cancelled) return;
       setInstalled(models);
 
+      // Builds before 2.1 kept the last model in its own file.
+      if (!loaded.lastModelId) {
+        try {
+          const legacyPath = `${RNFS.DocumentDirectoryPath}/last_model.json`;
+          if (await RNFS.exists(legacyPath)) {
+            const { modelId } = JSON.parse(await RNFS.readFile(legacyPath, 'utf8'));
+            if (typeof modelId === 'string') loaded = { ...loaded, lastModelId: modelId };
+            RNFS.unlink(legacyPath).catch(() => {});
+            if (!cancelled) setSettings(loaded);
+          }
+        } catch {
+          // Nothing to carry over.
+        }
+      }
+
       if (loaded.autoLoadLastModel && loaded.lastModelId) {
         const last = models.find(m => m.id === loaded.lastModelId);
-        if (last) loadModelRef.current?.(last);
+        if (last) {
+          logEvent('auto_restore_model', { modelId: last.id });
+          loadModelRef.current?.(last);
+        }
       }
     })();
     return () => {
@@ -231,6 +311,20 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
     setSettings(prev => ({ ...prev, ...patch }));
   }, []);
 
+  const resetSettings = useCallback(() => {
+    setSettings(prev => ({ ...DEFAULT_SETTINGS, lastModelId: prev.lastModelId }));
+    logEvent('settings_reset');
+  }, []);
+
+  const tuneForDevice = useCallback(async () => {
+    const device = await DocKit.getDeviceInfo();
+    if (!device) return false;
+    const tuned = recommendedSettings(device);
+    setSettings(prev => ({ ...prev, ...tuned }));
+    logEvent('settings_tuned', tuned);
+    return true;
+  }, []);
+
   const refreshInstalled = useCallback(async () => {
     const models = await syncWithFolder().catch(() => readRegistry());
     setInstalled(models);
@@ -248,9 +342,17 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
     [],
   );
 
+  /** Drops the previous chat's tokens from the KV cache so a different
+   * conversation starts clean. Never while a reply is streaming. */
+  const clearKvCache = useCallback(() => {
+    if (isGeneratingRef.current) return;
+    contextRef.current?.clearCache?.(false)?.catch?.(() => {});
+  }, []);
+
   const newChat = useCallback(() => {
     // An untouched blank chat is reused rather than stacking up empties.
     const existingBlank = conversationsRef.current.find(c => c.messages.length === 0);
+    clearKvCache();
     if (existingBlank) {
       setActiveId(existingBlank.id);
       return;
@@ -258,9 +360,15 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
     const fresh = emptyConversation();
     setConversations(prev => [fresh, ...prev]);
     setActiveId(fresh.id);
-  }, []);
+  }, [clearKvCache]);
 
-  const selectChat = useCallback((id: string) => setActiveId(id), []);
+  const selectChat = useCallback(
+    (id: string) => {
+      if (id !== activeIdRef.current) clearKvCache();
+      setActiveId(id);
+    },
+    [clearKvCache],
+  );
 
   const renameChat = useCallback(
     (id: string, title: string) => {
@@ -308,6 +416,10 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
     await releaseContext();
     setActiveModel(undefined);
     setLoadState({ status: 'idle' });
+    // An explicit unload is a decision, not a crash — don't reopen this
+    // model automatically on the next launch.
+    setSettings(prev => (prev.lastModelId ? { ...prev, lastModelId: undefined } : prev));
+    logEvent('model_unloaded');
   }, [releaseContext]);
 
   const loadModel = useCallback(
@@ -324,6 +436,7 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
         progress: 0,
         stage: 'Reading weights',
       });
+      logEvent('model_load_start', { modelId: model.id, sizeBytes: model.sizeBytes });
 
       try {
         if (!(await RNFS.exists(model.path))) {
@@ -362,21 +475,32 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
             stage: 'Starting vision encoder',
           });
           try {
-            await ctx.initMultimodal({
-              path: model.mmprojPath,
-              use_gpu: false,
-              image_max_tokens: s.imageMaxTokens,
-            });
+            // A projector that hangs (rather than errors) used to leave the
+            // app on the loading screen forever, so it gets a deadline.
+            await withTimeout(
+              ctx.initMultimodal({
+                path: model.mmprojPath,
+                use_gpu: false,
+                image_max_tokens: s.imageMaxTokens,
+              }),
+              MULTIMODAL_INIT_TIMEOUT_MS,
+              'Vision encoder init',
+            );
             const support = await ctx.getMultimodalSupport();
             vision = !!support?.vision;
-          } catch {
-            // A bad projector shouldn't cost you the text model too.
+          } catch (mmErr: any) {
+            // A bad or slow projector shouldn't cost you the text model too.
             vision = false;
+            logEvent('multimodal_init_failed', {
+              modelId: model.id,
+              message: mmErr?.message,
+            });
           }
         }
 
         setVisionEnabled(vision);
         setLoadState({ status: 'ready', modelId: model.id, vision });
+        logEvent('model_load_ready', { modelId: model.id, vision });
         setSettings(prev =>
           prev.lastModelId === model.id ? prev : { ...prev, lastModelId: model.id },
         );
@@ -387,6 +511,7 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
           modelId: model.id,
           message: err?.message ?? 'Failed to load this model.',
         });
+        logEvent('model_load_failed', { modelId: model.id, message: err?.message });
       }
     },
     [releaseContext],
@@ -405,7 +530,12 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const runCompletion = useCallback(
-    async (conversationId: string, history: ChatMessage[], assistantId: string) => {
+    async (
+      conversationId: string,
+      history: ChatMessage[],
+      assistantId: string,
+      opts: { extraInstruction?: string; seed?: string } = {},
+    ) => {
       const ctx = contextRef.current;
       if (!ctx) return;
 
@@ -442,7 +572,11 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
           apiMessages.push({ role: m.role, content: parts });
         }
 
-        let accumulated = '';
+        if (opts.extraInstruction) {
+          apiMessages.push({ role: 'user', content: opts.extraInstruction });
+        }
+
+        let accumulated = opts.seed ?? '';
         let tokenCount = 0;
         let lastPaint = 0;
 
@@ -461,14 +595,22 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
                 : {
                     ...c,
                     messages: c.messages.map(m =>
-                      m.id === assistantId ? { ...m, content: visible, reasoning } : m,
+                      m.id === assistantId
+                        ? {
+                            ...m,
+                            content: visible,
+                            // A continuation emits no new reasoning; keep the original.
+                            reasoning: reasoning || m.reasoning,
+                            truncated: false,
+                          }
+                        : m,
                     ),
                   },
             ),
           );
         };
 
-        await ctx.completion(
+        const result: any = await ctx.completion(
           {
             messages: apiMessages,
             n_predict: s.maxTokens,
@@ -486,6 +628,15 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
         const seconds = (Date.now() - startedAt) / 1000;
         const tps = seconds > 0 ? tokenCount / seconds : undefined;
         paint(true);
+        // Cut off (not finished) when it hit the length cap or the context
+        // window rather than a natural end — surfaced so a long code file
+        // doesn't just silently stop mid-function.
+        const truncated =
+          !stopRequested.current &&
+          !result?.interrupted &&
+          !result?.stopped_eos &&
+          !result?.stopped_word &&
+          (!!result?.stopped_limit || !!result?.context_full);
         setConversations(prev =>
           prev.map(c =>
             c.id !== conversationId
@@ -494,12 +645,19 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
                   ...c,
                   updatedAt: Date.now(),
                   messages: c.messages.map(m =>
-                    m.id === assistantId ? { ...m, tps } : m,
+                    m.id === assistantId ? { ...m, tps, truncated } : m,
                   ),
                 },
           ),
         );
+        if (truncated) {
+          logEvent('reply_truncated', {
+            maxTokens: s.maxTokens,
+            contextFull: !!result?.context_full,
+          });
+        }
       } catch (err: any) {
+        logEvent('generation_error', { message: err?.message });
         setConversations(prev =>
           prev.map(c =>
             c.id !== conversationId
@@ -636,6 +794,27 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
     await startTurn(conversationId, conv.messages.slice(0, lastUser + 1), []);
   }, [loadState, isGenerating, startTurn]);
 
+  const continueReply = useCallback(
+    async (messageId: string) => {
+      const conversationId = activeIdRef.current;
+      if (!conversationId || loadState.status !== 'ready' || isGenerating) return;
+      const conv = conversationsRef.current.find(c => c.id === conversationId);
+      if (!conv) return;
+      const idx = conv.messages.findIndex(m => m.id === messageId);
+      if (idx < 0 || conv.messages[idx].role !== 'assistant') return;
+      const target = conv.messages[idx];
+      // The cut-off turn goes back as context, a hidden instruction asks for
+      // the rest, and new tokens append onto the same bubble — one reply,
+      // not fragments across several turns.
+      await runCompletion(conversationId, conv.messages.slice(0, idx + 1), messageId, {
+        extraInstruction:
+          'Continue your previous reply exactly from where it stopped. Do not repeat anything you already said and do not restart from the beginning.',
+        seed: target.content,
+      });
+    },
+    [loadState, isGenerating, runCompletion],
+  );
+
   const value = useMemo<LlamaContextValue>(
     () => ({
       loadState,
@@ -654,11 +833,14 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
       deleteAllChats,
       settings,
       updateSettings,
+      resetSettings,
+      tuneForDevice,
       loadModel,
       unloadModel,
       sendMessage,
       editMessage,
       regenerate,
+      continueReply,
       stopGenerating,
     }),
     [
@@ -678,11 +860,14 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
       deleteAllChats,
       settings,
       updateSettings,
+      resetSettings,
+      tuneForDevice,
       loadModel,
       unloadModel,
       sendMessage,
       editMessage,
       regenerate,
+      continueReply,
       stopGenerating,
     ],
   );

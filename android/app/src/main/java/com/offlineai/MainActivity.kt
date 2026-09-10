@@ -19,4 +19,13 @@ class MainActivity : ReactActivity() {
    */
   override fun createReactActivityDelegate(): ReactActivityDelegate =
       DefaultReactActivityDelegate(this, mainComponentName, fabricEnabled)
+
+  /**
+   * Back on the root screen would otherwise finish() the Activity, which
+   * tears down the native llama context with it. Backgrounding keeps the
+   * loaded model alive for when the app is reopened.
+   */
+  override fun invokeDefaultOnBackPressed() {
+    moveTaskToBack(true)
+  }
 }

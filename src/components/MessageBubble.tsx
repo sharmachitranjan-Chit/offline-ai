@@ -66,6 +66,7 @@ function MessageBubble({
   streaming,
   onRetry,
   onEdit,
+  onContinue,
 }: {
   message: ChatMessage;
   maxWidth: number;
@@ -74,6 +75,7 @@ function MessageBubble({
   streaming?: boolean;
   onRetry?: () => void;
   onEdit?: (text: string) => void;
+  onContinue?: () => void;
 }) {
   const c = useColors();
   const styles = useStyles();
@@ -149,6 +151,19 @@ function MessageBubble({
           </View>
         )}
 
+        {!!message.truncated && !streaming && !message.error && (
+          <View style={styles.truncated}>
+            <Text style={styles.truncatedText}>
+              Cut off at the length limit — not actually finished.
+            </Text>
+            {!!onContinue && (
+              <Pressable onPress={onContinue} hitSlop={10}>
+                <Text style={styles.truncatedAction}>Continue</Text>
+              </Pressable>
+            )}
+          </View>
+        )}
+
         {!!message.content && !streaming && !message.error && (
           <View style={styles.footer}>
             <Pressable onPress={copy} hitSlop={10} style={styles.action}>
@@ -192,7 +207,10 @@ export default memo(MessageBubble, (prev, next) => {
     prev.streaming === next.streaming &&
     prev.showReasoning === next.showReasoning &&
     prev.showStats === next.showStats &&
-    prev.maxWidth === next.maxWidth
+    prev.maxWidth === next.maxWidth &&
+    !!prev.onRetry === !!next.onRetry &&
+    !!prev.onEdit === !!next.onEdit &&
+    !!prev.onContinue === !!next.onContinue
   );
 });
 
@@ -270,4 +288,17 @@ const useStyles = makeStyles(c => ({
   action: { flexDirection: 'row', alignItems: 'center', gap: spacing.xs },
   actionText: { color: c.textFaint, fontSize: fontSizes.xs, fontWeight: '600' },
   stat: { color: c.textFaint, fontSize: fontSizes.xxs, marginLeft: 'auto' },
+  truncated: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: spacing.md,
+    backgroundColor: c.warningSoft,
+    borderRadius: radius.sm,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+    marginTop: spacing.sm,
+  },
+  truncatedText: { color: c.warning, fontSize: fontSizes.xxs, flexShrink: 1 },
+  truncatedAction: { color: c.warning, fontSize: fontSizes.xs, fontWeight: '700' },
 }));

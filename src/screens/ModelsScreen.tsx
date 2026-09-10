@@ -37,10 +37,11 @@ import { useLlama } from '../context/LlamaContext';
 import { makeStyles, useColors } from '../context/ThemeContext';
 import { fontSizes, radius, spacing, useLayout } from '../theme';
 
-type Filter = 'all' | ModelTag;
+type Filter = 'all' | 'fits' | ModelTag;
 
 const FILTERS: Filter[] = [
   'all',
+  'fits',
   'recommended',
   'vision',
   'uncensored',
@@ -106,7 +107,13 @@ export default function ModelsScreen({
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
     return MODEL_CATALOG.filter(m => {
-      if (filter !== 'all' && !m.tags.includes(filter as ModelTag)) return false;
+      // "Fits" uses total RAM minus a realistic OS/background margin: free
+      // RAM swings from minute to minute, total doesn't.
+      if (filter === 'fits') {
+        if (deviceRamGiB !== undefined && m.minRamGiB > deviceRamGiB - 1.5) return false;
+      } else if (filter !== 'all' && !m.tags.includes(filter as ModelTag)) {
+        return false;
+      }
       if (!q) return true;
       return (
         m.label.toLowerCase().includes(q) ||
@@ -115,7 +122,7 @@ export default function ModelsScreen({
         m.description.toLowerCase().includes(q)
       );
     });
-  }, [filter, query]);
+  }, [filter, query, deviceRamGiB]);
 
   const statusFor = useCallback(
     (id: string) => ({
@@ -338,7 +345,11 @@ export default function ModelsScreen({
             onPress={() => setFilter(f)}
             style={[styles.filter, filter === f && styles.filterActive]}>
             <Text style={[styles.filterText, filter === f && styles.filterTextActive]}>
-              {f === 'all' ? 'Everything' : TAG_LABELS[f as ModelTag]}
+              {f === 'all'
+                ? 'Everything'
+                : f === 'fits'
+                ? 'Fits your phone'
+                : TAG_LABELS[f as ModelTag]}
             </Text>
           </Pressable>
         ))}

@@ -29,7 +29,11 @@ import ChatScreen from './src/screens/ChatScreen';
 import ModelsScreen from './src/screens/ModelsScreen';
 import SettingsScreen from './src/screens/SettingsScreen';
 import Drawer, { DrawerDestination } from './src/components/Drawer';
+import ErrorBoundary from './src/components/ErrorBoundary';
+import { installGlobalCrashLogging, logEvent } from './src/services/diagnostics';
 import { useLayout } from './src/theme';
+
+installGlobalCrashLogging();
 
 function Shell() {
   const {
@@ -62,6 +66,18 @@ function Shell() {
     });
     return () => sub.remove();
   }, [screen]);
+
+  // Root of the app: back sends it to the background (MainActivity turns the
+  // default into moveTaskToBack), so the loaded model survives. Registered
+  // once, so the drawer's and sub-screens' handlers always run before it.
+  useEffect(() => {
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+      logEvent('back_button_background');
+      BackHandler.exitApp();
+      return true;
+    });
+    return () => sub.remove();
+  }, []);
 
   /**
    * Edge swipe to open the drawer.
@@ -145,7 +161,11 @@ export default function App() {
     <SafeAreaProvider initialMetrics={initialWindowMetrics}>
       <ThemeProvider>
         <LlamaProvider>
-          <Shell />
+          {/* Inside the provider, so "Try again" never tears down the
+              running model along with the broken screen. */}
+          <ErrorBoundary>
+            <Shell />
+          </ErrorBoundary>
         </LlamaProvider>
       </ThemeProvider>
     </SafeAreaProvider>

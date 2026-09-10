@@ -80,7 +80,7 @@ export default function StorageCard({
       // would appear to have lost every model the moment you change folder.
       if (previous && previous !== option.path) {
         const result = await migrateModels(previous, option.path);
-        await repointRegistry(previous, option.path);
+        await repointRegistry(previous, option.path, result.moves);
         if (result.moved.length) {
           setNotice(
             `Moved ${result.moved.length} file${
@@ -106,7 +106,7 @@ export default function StorageCard({
     if (!storage) return;
     setBusy('legacy');
     const result = await migrateModels(LEGACY_MODELS_DIR, storage.dir);
-    await repointRegistry(LEGACY_MODELS_DIR, storage.dir);
+    await repointRegistry(LEGACY_MODELS_DIR, storage.dir, result.moves);
     setBusy(null);
     setNotice(
       result.failed.length

@@ -94,6 +94,21 @@ export async function localPathFor(
 // Registry
 // -------------------------------------------------------------------
 
+/** The registry as written, without dropping entries whose file is gone. */
+async function readRegistryRaw(): Promise<InstalledModel[]> {
+  try {
+    let raw: string | null = null;
+    if (await RNFS.exists(REGISTRY_PATH)) {
+      raw = await RNFS.readFile(REGISTRY_PATH, 'utf8');
+    } else if (await RNFS.exists(LEGACY_REGISTRY_PATH)) {
+      raw = await RNFS.readFile(LEGACY_REGISTRY_PATH, 'utf8');
+    }
+    return raw ? ((JSON.parse(raw) as Registry).models ?? []) : [];
+  } catch {
+    return [];
+  }
+}
+
 export async function readRegistry(): Promise<InstalledModel[]> {
   try {
     let raw: string | null = null;
@@ -571,12 +586,20 @@ export async function importScannedModel(
 export async function repointRegistry(
   fromDir: string,
   toDir: string,
+  moves: Array<{ from: string; to: string }> = [],
 ): Promise<InstalledModel[]> {
-  const registry = await readRegistry();
+  // Must be the raw registry: by now the files have left their old paths,
+  // and the filtered read would silently drop every entry being moved —
+  // losing their catalog ids (and with that, auto-load of the last model).
+  const registry = await readRegistryRaw();
+  const exact = new Map(moves.map(m => [m.from, m.to]));
   const next: InstalledModel[] = [];
   for (const m of registry) {
     const repoint = (p?: string) =>
-      p && p.startsWith(fromDir) ? `${toDir}${p.slice(fromDir.length)}` : p;
+      !p
+        ? p
+        : exact.get(p) ??
+          (p.startsWith(fromDir + '/') ? `${toDir}${p.slice(fromDir.length)}` : p);
     const path = repoint(m.path)!;
     const mmprojPath = repoint(m.mmprojPath);
     if (await RNFS.exists(path)) {
