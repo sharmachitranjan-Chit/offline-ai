@@ -1,49 +1,133 @@
-import React, { useState } from 'react';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
-import { ChatMessage } from '../context/LlamaContext';
+import React, { memo, useEffect, useRef, useState } from 'react';
+import { Animated, Easing, Pressable, Text, View } from 'react-native';
+import { ChatMessage } from '../services/conversations';
 import { DocKit } from '../native/DocKit';
 import AttachmentChip from './AttachmentChip';
+import Icon from './Icon';
 import Markdown from './Markdown';
-import { colors, fontSizes, radius, spacing } from '../theme';
+import { makeStyles, useColors } from '../context/ThemeContext';
+import { fontSizes, radius, spacing } from '../theme';
 
-export default function MessageBubble({
+/**
+ * One turn in the conversation.
+ *
+ * The user's turn is a bubble; the assistant's is not. That asymmetry is
+ * deliberate and is what makes a long reply readable on a phone — a wall of
+ * text inside a tinted rounded rectangle is harder to scan than the same text
+ * set flat on the page, and the alternating alignment already makes clear who
+ * said what.
+ */
+
+function TypingDots() {
+  const styles = useStyles();
+  const c = useColors();
+  const anim = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.timing(anim, {
+        toValue: 3,
+        duration: 1050,
+        easing: Easing.linear,
+        useNativeDriver: true,
+      }),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [anim]);
+
+  return (
+    <View style={styles.dots}>
+      {[0, 1, 2].map(i => (
+        <Animated.View
+          key={i}
+          style={[
+            styles.dot,
+            {
+              backgroundColor: c.textFaint,
+              opacity: anim.interpolate({
+                inputRange: [i - 0.5, i, i + 0.5, i + 1.5, 3],
+                outputRange: [0.25, 1, 0.25, 0.25, 0.25],
+                extrapolate: 'clamp',
+              }),
+            },
+          ]}
+        />
+      ))}
+    </View>
+  );
+}
+
+function MessageBubble({
   message,
   maxWidth,
   showReasoning,
+  showStats,
   streaming,
-  onContinue,
+  onRetry,
+  onEdit,
 }: {
   message: ChatMessage;
   maxWidth: number;
   showReasoning: boolean;
+  showStats?: boolean;
   streaming?: boolean;
-  onContinue?: () => void;
+  onRetry?: () => void;
+  onEdit?: (text: string) => void;
 }) {
+  const c = useColors();
+  const styles = useStyles();
   const [expanded, setExpanded] = useState(false);
+  const [copied, setCopied] = useState(false);
   const isUser = message.role === 'user';
   const hasReasoning = !!message.reasoning?.trim();
 
-  return (
-    <View
-      style={[
-        styles.row,
-        isUser ? styles.rowUser : styles.rowAssistant,
-      ]}>
-      <View
-        style={[
-          styles.bubble,
-          { maxWidth },
-          isUser ? styles.bubbleUser : styles.bubbleAssistant,
-          message.error && styles.bubbleError,
-        ]}>
-        {!!message.attachments?.length && (
-          <View style={styles.attachments}>
-            {message.attachments.map(a => (
-              <AttachmentChip key={a.id} attachment={a} compactPreview />
-            ))}
-          </View>
-        )}
+  const copy = () => {
+    DocKit.setClipboard(message.content);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1600);
+  };
 
+  if (isUser) {
+    return (
+      <View style={[styles.row, styles.rowUser]}>
+        <View style={{ maxWidth, alignItems: 'flex-end' }}>
+          {!!message.attachments?.length && (
+            <View style={styles.attachments}>
+              {message.attachments.map(a => (
+                <AttachmentChip key={a.id} attachment={a} compactPreview />
+              ))}
+            </View>
+          )}
+          {!!message.content && (
+            <Pressable
+              onLongPress={copy}
+              delayLongPress={280}
+              style={styles.bubbleUser}>
+              <Text style={styles.userText} selectable>
+                {message.content}
+              </Text>
+            </Pressable>
+          )}
+          <View style={styles.userActions}>
+            {copied && <Text style={styles.copied}>Copied</Text>}
+            {!!onEdit && !!message.content && (
+              <Pressable
+                onPress={() => onEdit(message.content)}
+                hitSlop={10}
+                accessibilityLabel="Edit and resend">
+                <Icon name="edit" size={13} color={c.textFaint} />
+              </Pressable>
+            )}
+          </View>
+        </View>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.row}>
+      <View style={[styles.assistant, { maxWidth }, message.error && styles.errorBox]}>
         {hasReasoning && (showReasoning || expanded) && (
           <View style={styles.reasoning}>
             <Text style={styles.reasoningLabel}>Reasoning</Text>
@@ -52,49 +136,43 @@ export default function MessageBubble({
         )}
 
         {!!message.content && (
-          isUser ? (
-            <Text style={styles.userText} selectable>
-              {message.content}
-            </Text>
-          ) : (
-            <Markdown content={message.content} />
-          )
+          <Markdown
+            content={message.content}
+            color={message.error ? c.danger : c.textPrimary}
+          />
         )}
 
         {!message.content && streaming && (
-          <Text style={styles.thinking}>
-            {hasReasoning ? 'Thinking…' : 'Generating…'}
-          </Text>
-        )}
-
-        {!isUser && message.truncated && !streaming && (
-          <View style={styles.truncatedNotice}>
-            <Text style={styles.truncatedText}>
-              ⚠ Cut off at the length limit, not actually finished.
-            </Text>
-            {!!onContinue && (
-              <Pressable onPress={onContinue} hitSlop={8}>
-                <Text style={styles.truncatedAction}>Continue →</Text>
-              </Pressable>
-            )}
+          <View style={styles.streamingRow}>
+            <TypingDots />
+            {hasReasoning && <Text style={styles.thinking}>Thinking…</Text>}
           </View>
         )}
 
-        {!isUser && !!message.content && !streaming && (
+        {!!message.content && !streaming && !message.error && (
           <View style={styles.footer}>
+            <Pressable onPress={copy} hitSlop={10} style={styles.action}>
+              <Icon name={copied ? 'check' : 'copy'} size={13} color={c.textFaint} />
+              <Text style={styles.actionText}>{copied ? 'Copied' : 'Copy'}</Text>
+            </Pressable>
+            {!!onRetry && (
+              <Pressable onPress={onRetry} hitSlop={10} style={styles.action}>
+                <Icon name="retry" size={13} color={c.textFaint} background={c.background} />
+                <Text style={styles.actionText}>Retry</Text>
+              </Pressable>
+            )}
             {hasReasoning && !showReasoning && (
-              <Pressable onPress={() => setExpanded(v => !v)} hitSlop={8}>
-                <Text style={styles.action}>
-                  {expanded ? 'Hide reasoning' : 'Show reasoning'}
+              <Pressable
+                onPress={() => setExpanded(v => !v)}
+                hitSlop={10}
+                style={styles.action}>
+                <Icon name="eye" size={13} color={c.textFaint} />
+                <Text style={styles.actionText}>
+                  {expanded ? 'Hide reasoning' : 'Reasoning'}
                 </Text>
               </Pressable>
             )}
-            <Pressable
-              onPress={() => DocKit.setClipboard(message.content)}
-              hitSlop={8}>
-              <Text style={styles.action}>Copy</Text>
-            </Pressable>
-            {!!message.tps && (
+            {showStats && !!message.tps && (
               <Text style={styles.stat}>{message.tps.toFixed(1)} tok/s</Text>
             )}
           </View>
@@ -104,62 +182,84 @@ export default function MessageBubble({
   );
 }
 
-const styles = StyleSheet.create({
+/**
+ * Only the streaming message changes while a reply is generating; without
+ * this every finished message in a long chat re-renders on each repaint.
+ */
+export default memo(MessageBubble, (prev, next) => {
+  return (
+    prev.message === next.message &&
+    prev.streaming === next.streaming &&
+    prev.showReasoning === next.showReasoning &&
+    prev.showStats === next.showStats &&
+    prev.maxWidth === next.maxWidth
+  );
+});
+
+const useStyles = makeStyles(c => ({
   row: {
     paddingHorizontal: spacing.lg,
-    marginBottom: spacing.md,
+    marginBottom: spacing.lg,
     flexDirection: 'row',
   },
   rowUser: { justifyContent: 'flex-end' },
-  rowAssistant: { justifyContent: 'flex-start' },
-  bubble: {
-    borderRadius: radius.md,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.md,
-  },
   bubbleUser: {
-    backgroundColor: colors.bubbleUser,
+    backgroundColor: c.bubbleUser,
+    borderRadius: radius.lg,
     borderBottomRightRadius: radius.xs,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm + 2,
   },
-  bubbleAssistant: {
-    backgroundColor: colors.bubbleAssistant,
-    borderWidth: 1,
-    borderColor: colors.borderSoft,
-    borderBottomLeftRadius: radius.xs,
-  },
-  bubbleError: {
-    borderColor: colors.danger,
-    backgroundColor: colors.dangerSoft,
-  },
-  attachments: { flexDirection: 'row', flexWrap: 'wrap', marginBottom: spacing.xs },
   userText: {
-    color: colors.textPrimary,
+    color: c.bubbleUserText,
     fontSize: fontSizes.md,
-    lineHeight: 21,
+    lineHeight: 22,
   },
+  userActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.md,
+    marginTop: spacing.xs,
+    paddingRight: spacing.xxs,
+    minHeight: 14,
+  },
+  copied: { color: c.textFaint, fontSize: fontSizes.xxs },
+  assistant: { flex: 1 },
+  errorBox: {
+    borderWidth: 1,
+    borderColor: c.danger,
+    backgroundColor: c.dangerSoft,
+    borderRadius: radius.md,
+    padding: spacing.md,
+  },
+  attachments: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'flex-end' },
+  streamingRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.md },
+  dots: { flexDirection: 'row', gap: 5, paddingVertical: spacing.sm },
+  dot: { width: 6, height: 6, borderRadius: 3 },
   thinking: {
-    color: colors.textSecondary,
-    fontSize: fontSizes.sm,
+    color: c.textFaint,
+    fontSize: fontSizes.xs,
     fontStyle: 'italic',
   },
   reasoning: {
-    backgroundColor: colors.surfaceHigh,
-    borderRadius: radius.xs,
-    padding: spacing.sm,
+    backgroundColor: c.surfaceAlt,
+    borderRadius: radius.sm,
+    borderLeftWidth: 3,
+    borderLeftColor: c.accentMuted,
+    padding: spacing.md,
     marginBottom: spacing.sm,
   },
   reasoningLabel: {
-    color: colors.textFaint,
+    color: c.textFaint,
     fontSize: fontSizes.xxs,
     textTransform: 'uppercase',
     letterSpacing: 0.6,
     marginBottom: 2,
   },
   reasoningText: {
-    color: colors.textSecondary,
+    color: c.textSecondary,
     fontSize: fontSizes.xs,
-    lineHeight: 18,
-    fontStyle: 'italic',
+    lineHeight: 19,
   },
   footer: {
     flexDirection: 'row',
@@ -167,27 +267,7 @@ const styles = StyleSheet.create({
     gap: spacing.lg,
     marginTop: spacing.sm,
   },
-  action: { color: colors.textFaint, fontSize: fontSizes.xs, fontWeight: '600' },
-  truncatedNotice: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    backgroundColor: colors.warningSoft,
-    borderRadius: radius.xs,
-    paddingVertical: spacing.xs,
-    paddingHorizontal: spacing.sm,
-    marginTop: spacing.sm,
-    gap: spacing.sm,
-  },
-  truncatedText: {
-    color: colors.warning,
-    fontSize: fontSizes.xxs,
-    flexShrink: 1,
-  },
-  truncatedAction: {
-    color: colors.warning,
-    fontSize: fontSizes.xxs,
-    fontWeight: '700',
-  },
-  stat: { color: colors.textFaint, fontSize: fontSizes.xxs, marginLeft: 'auto' },
-});
+  action: { flexDirection: 'row', alignItems: 'center', gap: spacing.xs },
+  actionText: { color: c.textFaint, fontSize: fontSizes.xs, fontWeight: '600' },
+  stat: { color: c.textFaint, fontSize: fontSizes.xxs, marginLeft: 'auto' },
+}));

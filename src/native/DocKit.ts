@@ -47,6 +47,29 @@ export type DeviceInfo = {
   sdk: number;
   downloadsDir: string;
   freeDiskBytes: number;
+  freeSharedBytes: number;
+  allFilesAccess: boolean;
+};
+
+export type StorageOption = {
+  id: string;
+  label: string;
+  path: string;
+  /** True when other apps on the phone can read this folder. */
+  shared: boolean;
+  removable: boolean;
+  needsAllFiles: boolean;
+  /** Whether the app can write here right now, permissions included. */
+  writable: boolean;
+  exists: boolean;
+  modelCount: number;
+  freeBytes: number;
+};
+
+export type EnsureDirResult = {
+  ok: boolean;
+  message?: string;
+  freeBytes?: number;
 };
 
 type DocKitNative = {
@@ -62,10 +85,18 @@ type DocKitNative = {
   partialSize(destPath: string): Promise<number>;
   scanForModels(): Promise<ScannedModelFile[]>;
   copyToModels(uri: string, fileName: string, destDir: string): Promise<string>;
+  getStorageOptions(): Promise<StorageOption[]>;
+  ensureDir(path: string): Promise<EnsureDirResult>;
+  moveFile(from: string, to: string): Promise<string>;
+  listGguf(path: string): Promise<ScannedModelFile[]>;
+  deleteFile(path: string): Promise<boolean>;
+  freeSpace(path: string): Promise<number>;
+  requestLegacyStoragePermission(): Promise<boolean>;
   setClipboard(text: string): void;
   openUrl(url: string): Promise<boolean>;
   setImmersive(enabled: boolean): void;
   setKeepScreenOn(enabled: boolean): void;
+  setSystemBars(colorHex: string, darkTheme: boolean): void;
   getDeviceInfo(): Promise<DeviceInfo>;
   hasAllFilesAccess(): Promise<boolean>;
   requestAllFilesAccess(): Promise<boolean>;
@@ -167,6 +198,62 @@ export const DocKit = {
     return native.copyToModels(uri, fileName, destDir);
   },
 
+  // ---- storage locations -------------------------------------------
+
+  async getStorageOptions(): Promise<StorageOption[]> {
+    try {
+      return (await native.getStorageOptions?.()) ?? [];
+    } catch {
+      return [];
+    }
+  },
+
+  async ensureDir(path: string): Promise<EnsureDirResult> {
+    if (!native.ensureDir) return { ok: false, message: 'Storage is unavailable.' };
+    try {
+      return await native.ensureDir(path);
+    } catch (e: any) {
+      return { ok: false, message: e?.message ?? 'That folder cannot be used.' };
+    }
+  },
+
+  async moveFile(from: string, to: string): Promise<string> {
+    if (!native.moveFile) throw unavailable('Moving a file');
+    return native.moveFile(from, to);
+  },
+
+  async listGguf(path: string): Promise<ScannedModelFile[]> {
+    try {
+      return (await native.listGguf?.(path)) ?? [];
+    } catch {
+      return [];
+    }
+  },
+
+  async deleteFile(path: string): Promise<boolean> {
+    try {
+      return (await native.deleteFile?.(path)) ?? false;
+    } catch {
+      return false;
+    }
+  },
+
+  async freeSpace(path: string): Promise<number> {
+    try {
+      return (await native.freeSpace?.(path)) ?? 0;
+    } catch {
+      return 0;
+    }
+  },
+
+  async requestLegacyStoragePermission(): Promise<boolean> {
+    try {
+      return (await native.requestLegacyStoragePermission?.()) ?? false;
+    } catch {
+      return false;
+    }
+  },
+
   setClipboard(text: string) {
     native.setClipboard?.(text);
   },
@@ -182,6 +269,9 @@ export const DocKit = {
   },
   setKeepScreenOn(enabled: boolean) {
     native.setKeepScreenOn?.(enabled);
+  },
+  setSystemBars(colorHex: string, darkTheme: boolean) {
+    native.setSystemBars?.(colorHex, darkTheme);
   },
   async getDeviceInfo(): Promise<DeviceInfo | null> {
     try {

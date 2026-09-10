@@ -3,61 +3,85 @@ import {
   ActivityIndicator,
   FlatList,
   KeyboardAvoidingView,
+  NativeScrollEvent,
+  NativeSyntheticEvent,
   Platform,
   Pressable,
-  ScrollView,
-  StyleSheet,
   Text,
-  TextInput,
   View,
 } from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useLlama } from '../context/LlamaContext';
-import { Attachment, pickAttachments } from '../services/attachments';
-import AttachmentChip from '../components/AttachmentChip';
+import Composer from '../components/Composer';
+import Icon from '../components/Icon';
 import MessageBubble from '../components/MessageBubble';
 import ProgressBar from '../components/ProgressBar';
-import { colors, fontSizes, radius, spacing, useLayout } from '../theme';
+import Sheet, { SheetRow, SheetSection } from '../components/Sheet';
+import TopBar from '../components/TopBar';
+import { useLlama } from '../context/LlamaContext';
+import { MODEL_CATALOG } from '../data/modelCatalog';
+import { ChatMessage } from '../services/conversations';
+import { Attachment, pickAttachments } from '../services/attachments';
+import { formatBytes } from '../services/modelManager';
+import { makeStyles, useColors } from '../context/ThemeContext';
+import { fontSizes, radius, spacing, useLayout } from '../theme';
+
+const SUGGESTIONS = [
+  'Explain this in simple terms:',
+  'Summarise the document I am attaching',
+  'Draft a polite reply to this message:',
+  'What is wrong with this code?',
+];
 
 export default function ChatScreen({
-  onGoToModels,
+  onOpenDrawer,
+  onOpenModels,
 }: {
-  onGoToModels: () => void;
+  onOpenDrawer: () => void;
+  onOpenModels: () => void;
 }) {
   const {
     loadState,
     activeModel,
+    installed,
     visionEnabled,
     messages,
     isGenerating,
     settings,
     sendMessage,
+    editMessage,
     stopGenerating,
     regenerate,
-    continueReply,
-    resetChat,
+    newChat,
+    loadModel,
   } = useLlama();
 
+  const c = useColors();
+  const styles = useStyles();
   const layout = useLayout();
-  const insets = useSafeAreaInsets();
+
   const [draft, setDraft] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [picking, setPicking] = useState(false);
   const [pickError, setPickError] = useState<string | null>(null);
-  const listRef = useRef<FlatList<any>>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [switcherOpen, setSwitcherOpen] = useState(false);
+  const [atBottom, setAtBottom] = useState(true);
+  const listRef = useRef<FlatList<ChatMessage>>(null);
 
   const ready = loadState.status === 'ready';
-  const canSend = ready && !isGenerating && (!!draft.trim() || attachments.length > 0);
 
-  // Follow the stream, but only when new content actually arrives.
+  // Follow the stream, but never yank the view away from someone who has
+  // scrolled up to read something earlier.
   useEffect(() => {
-    if (messages.length === 0) return;
-    const t = setTimeout(
-      () => listRef.current?.scrollToEnd({ animated: true }),
-      60,
-    );
+    if (!messages.length || !atBottom) return;
+    const t = setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 60);
     return () => clearTimeout(t);
-  }, [messages]);
+  }, [messages, atBottom]);
+
+  const onScroll = useCallback((e: NativeSyntheticEvent<NativeScrollEvent>) => {
+    const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
+    const distance = contentSize.height - contentOffset.y - layoutMeasurement.height;
+    setAtBottom(distance < 90);
+  }, []);
 
   const handleAttach = useCallback(async (imagesOnly: boolean) => {
     setPickError(null);
@@ -77,200 +101,272 @@ export default function ChatScreen({
     const files = attachments;
     setDraft('');
     setAttachments([]);
+    setAtBottom(true);
+    if (editingId) {
+      const id = editingId;
+      setEditingId(null);
+      editMessage(id, text);
+      return;
+    }
     sendMessage(text, files);
-  }, [draft, attachments, sendMessage]);
+  }, [draft, attachments, editingId, editMessage, sendMessage]);
+
+  const startEdit = useCallback((id: string, text: string) => {
+    setEditingId(id);
+    setDraft(text);
+  }, []);
 
   const removeAttachment = useCallback((id: string) => {
     setAttachments(prev => prev.filter(a => a.id !== id));
   }, []);
 
-  // ---- states before a model is usable ------------------------------
+  // ---- loading a model ----------------------------------------------
 
   if (loadState.status === 'loading') {
     return (
-      <View style={[styles.center, { paddingTop: insets.top }]}>
-        <ActivityIndicator color={colors.accent} />
-        <Text style={styles.centerTitle}>
-          Loading {activeModel?.label ?? 'model'}
-        </Text>
-        <Text style={styles.centerBody}>{loadState.stage}</Text>
-        <View style={{ width: layout.contentWidth * 0.7, marginTop: spacing.lg }}>
-          <ProgressBar fraction={loadState.progress / 100} />
+      <View style={styles.flex}>
+        <TopBar
+          title="Loading model"
+          subtitle={activeModel?.label}
+          onLeading={onOpenDrawer}
+        />
+        <View style={styles.center}>
+          <ActivityIndicator color={c.accent} />
+          <Text style={styles.centerTitle}>{activeModel?.label ?? 'Model'}</Text>
+          <Text style={styles.centerBody}>{loadState.stage}</Text>
+          <View style={{ width: layout.contentWidth * 0.7, marginTop: spacing.lg }}>
+            <ProgressBar fraction={loadState.progress / 100} />
+          </View>
+          <Text style={styles.centerHint}>
+            The first load of a large model takes the longest — the whole file
+            has to be read off storage before anything can happen.
+          </Text>
         </View>
-        <Text style={styles.centerHint}>
-          The first load of a large model takes the longest — the file has to
-          be read off storage before anything can happen.
-        </Text>
       </View>
     );
   }
+
+  // ---- nothing loaded yet -------------------------------------------
 
   if (!ready) {
     const failed = loadState.status === 'error';
     return (
-      <View style={[styles.center, { paddingTop: insets.top }]}>
-        <Text style={styles.centerEmoji}>{failed ? '⚠️' : '🧠'}</Text>
-        <Text style={styles.centerTitle}>
-          {failed ? "That model didn't load" : 'No model loaded yet'}
-        </Text>
-        <Text style={styles.centerBody}>
-          {failed
-            ? loadState.message
-            : 'Download one from the Models tab, or import a .gguf file you already have in your Downloads folder. Everything runs on this device.'}
-        </Text>
-        <Pressable style={styles.primaryBtn} onPress={onGoToModels}>
-          <Text style={styles.primaryBtnText}>
-            {failed ? 'Back to models' : 'Choose a model'}
+      <View style={styles.flex}>
+        <TopBar
+          title="Offline AI"
+          subtitle={failed ? 'Model failed to load' : 'No model loaded'}
+          onLeading={onOpenDrawer}
+        />
+        <View style={styles.center}>
+          <View style={[styles.badge, failed && styles.badgeBad]}>
+            <Icon
+              name={failed ? 'info' : 'chip'}
+              size={26}
+              color={failed ? c.danger : c.accent}
+            />
+          </View>
+          <Text style={styles.centerTitle}>
+            {failed ? "That model didn't load" : 'Choose a model to begin'}
           </Text>
-        </Pressable>
+          <Text style={styles.centerBody}>
+            {failed
+              ? loadState.message
+              : installed.length
+              ? 'You have models ready — pick one and it stays loaded until you change it.'
+              : 'Download one from the Models screen, or copy any .gguf into your models folder and it will show up here.'}
+          </Text>
+
+          {installed.length > 0 && (
+            <View style={styles.readyList}>
+              {installed.slice(0, 4).map(m => (
+                <Pressable
+                  key={m.id}
+                  style={({ pressed }) => [styles.readyRow, pressed && styles.pressed]}
+                  onPress={() => loadModel(m)}>
+                  <Icon name="chip" size={16} color={c.textSecondary} />
+                  <View style={styles.flex}>
+                    <Text style={styles.readyName} numberOfLines={1}>
+                      {m.label}
+                    </Text>
+                    <Text style={styles.readyMeta}>
+                      {formatBytes(m.sizeBytes)}
+                      {m.mmprojPath ? ' · sees images' : ''}
+                    </Text>
+                  </View>
+                  <Text style={styles.readyAction}>Load</Text>
+                </Pressable>
+              ))}
+            </View>
+          )}
+
+          <Pressable style={styles.primaryBtn} onPress={onOpenModels}>
+            <Text style={styles.primaryBtnText}>
+              {installed.length ? 'Browse all models' : 'Get a model'}
+            </Text>
+          </Pressable>
+        </View>
       </View>
     );
   }
 
-  // ---- the chat itself ----------------------------------------------
+  // ---- the chat itself ------------------------------------------------
 
   return (
     <KeyboardAvoidingView
       style={styles.flex}
       behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
       keyboardVerticalOffset={0}>
-      <View style={[styles.header, { paddingTop: insets.top + spacing.sm }]}>
-        <View style={styles.headerText}>
-          <Text style={styles.headerTitle} numberOfLines={1}>
-            {activeModel?.label}
-          </Text>
-          <Text style={styles.headerSub}>
-            {visionEnabled ? 'Text, images and documents' : 'Text and documents'}
-            {isGenerating ? ' · generating…' : ''}
-          </Text>
-        </View>
-        {messages.length > 0 && (
-          <View style={styles.headerActions}>
-            {!isGenerating && (
-              <Pressable onPress={regenerate} hitSlop={8}>
-                <Text style={styles.headerAction}>Retry</Text>
-              </Pressable>
-            )}
-            <Pressable onPress={resetChat} hitSlop={8}>
-              <Text style={styles.headerAction}>Clear</Text>
-            </Pressable>
-          </View>
-        )}
-      </View>
-
-      <FlatList
-        ref={listRef}
-        style={styles.flex}
-        data={messages}
-        keyExtractor={m => m.id}
-        keyboardShouldPersistTaps="handled"
-        contentContainerStyle={[
-          styles.listContent,
-          messages.length === 0 && styles.listEmpty,
+      <TopBar
+        title={activeModel?.label ?? 'Offline AI'}
+        subtitle={`${visionEnabled ? 'Text, images and documents' : 'Text and documents'}${
+          isGenerating ? ' · generating…' : ''
+        }`}
+        onLeading={onOpenDrawer}
+        onTitlePress={() => setSwitcherOpen(true)}
+        actions={[
+          {
+            icon: 'compose',
+            label: 'New chat',
+            onPress: () => {
+              newChat();
+              setDraft('');
+              setAttachments([]);
+              setEditingId(null);
+            },
+          },
         ]}
-        renderItem={({ item, index }) => (
-          <MessageBubble
-            message={item}
-            maxWidth={layout.bubbleMaxWidth}
-            showReasoning={settings.showReasoning}
-            streaming={isGenerating && index === messages.length - 1}
-            onContinue={
-              item.truncated && !isGenerating
-                ? () => continueReply(item.id)
-                : undefined
-            }
-          />
-        )}
-        ListEmptyComponent={
-          <View style={styles.emptyChat}>
-            <Text style={styles.centerEmoji}>👋</Text>
-            <Text style={styles.centerTitle}>Ready when you are</Text>
-            <Text style={styles.centerBody}>
-              Ask anything, or attach a photo, PDF, spreadsheet or document
-              and ask about it.
-              {!visionEnabled &&
-                ' This model reads text but cannot see images — load a vision model if you want to send photos.'}
-            </Text>
-          </View>
-        }
       />
 
-      {!!attachments.length && (
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          style={styles.attachStrip}
-          contentContainerStyle={styles.attachStripContent}>
-          {attachments.map(a => (
-            <AttachmentChip
-              key={a.id}
-              attachment={a}
-              onRemove={() => removeAttachment(a.id)}
+      <View style={styles.flex}>
+        <FlatList
+          ref={listRef}
+          style={styles.flex}
+          data={messages}
+          keyExtractor={m => m.id}
+          keyboardShouldPersistTaps="handled"
+          onScroll={onScroll}
+          scrollEventThrottle={64}
+          removeClippedSubviews={false}
+          contentContainerStyle={[
+            styles.listContent,
+            messages.length === 0 && styles.listEmpty,
+          ]}
+          renderItem={({ item, index }) => (
+            <MessageBubble
+              message={item}
+              maxWidth={layout.bubbleMaxWidth}
+              showReasoning={settings.showReasoning}
+              showStats={settings.showStats}
+              streaming={isGenerating && index === messages.length - 1}
+              onRetry={
+                index === messages.length - 1 && !isGenerating ? regenerate : undefined
+              }
+              onEdit={
+                item.role === 'user' && !isGenerating
+                  ? text => startEdit(item.id, text)
+                  : undefined
+              }
             />
-          ))}
-        </ScrollView>
-      )}
+          )}
+          ListEmptyComponent={
+            <View style={styles.emptyChat}>
+              <Text style={styles.emptyTitle}>Ready when you are</Text>
+              <Text style={styles.emptyBody}>
+                Everything runs on this phone. Ask anything, or attach a photo,
+                PDF, spreadsheet or document and ask about it.
+                {!visionEnabled &&
+                  ' This model reads text but cannot see images — load a vision model if you want to send photos.'}
+              </Text>
+              <View style={styles.suggestions}>
+                {SUGGESTIONS.map(s => (
+                  <Pressable
+                    key={s}
+                    style={({ pressed }) => [
+                      styles.suggestion,
+                      pressed && styles.pressed,
+                    ]}
+                    onPress={() => setDraft(`${s} `)}>
+                    <Text style={styles.suggestionText}>{s}</Text>
+                  </Pressable>
+                ))}
+              </View>
+            </View>
+          }
+        />
 
-      {!!pickError && <Text style={styles.pickError}>{pickError}</Text>}
-
-      <View
-        style={[
-          styles.composer,
-          { paddingBottom: spacing.sm + Math.max(insets.bottom - spacing.sm, 0) },
-        ]}>
-        <View style={styles.composerRow}>
+        {!atBottom && messages.length > 2 && (
           <Pressable
-            style={styles.iconBtn}
-            onPress={() => handleAttach(false)}
-            disabled={picking || isGenerating}
-            accessibilityLabel="Attach a file">
-            {picking ? (
-              <ActivityIndicator size="small" color={colors.textSecondary} />
-            ) : (
-              <Text style={styles.iconBtnText}>＋</Text>
-            )}
+            style={styles.jump}
+            onPress={() => {
+              setAtBottom(true);
+              listRef.current?.scrollToEnd({ animated: true });
+            }}
+            accessibilityLabel="Jump to the latest message">
+            <Icon name="arrowDown" size={15} color={c.textPrimary} />
           </Pressable>
-
-          {visionEnabled && (
-            <Pressable
-              style={styles.iconBtn}
-              onPress={() => handleAttach(true)}
-              disabled={picking || isGenerating}
-              accessibilityLabel="Attach an image">
-              <Text style={styles.iconBtnText}>🖼</Text>
-            </Pressable>
-          )}
-
-          <TextInput
-            style={styles.input}
-            placeholder="Message…"
-            placeholderTextColor={colors.textFaint}
-            value={draft}
-            onChangeText={setDraft}
-            editable={!isGenerating}
-            multiline
-            textAlignVertical="center"
-          />
-
-          {isGenerating ? (
-            <Pressable style={[styles.sendBtn, styles.stopBtn]} onPress={stopGenerating}>
-              <Text style={styles.stopBtnText}>■</Text>
-            </Pressable>
-          ) : (
-            <Pressable
-              style={[styles.sendBtn, !canSend && styles.sendBtnDisabled]}
-              onPress={handleSend}
-              disabled={!canSend}>
-              <Text style={styles.sendBtnText}>↑</Text>
-            </Pressable>
-          )}
-        </View>
+        )}
       </View>
+
+      <Composer
+        value={draft}
+        onChangeText={setDraft}
+        attachments={attachments}
+        onRemoveAttachment={removeAttachment}
+        onPickFiles={() => handleAttach(false)}
+        onPickImages={() => handleAttach(true)}
+        onSend={handleSend}
+        onStop={stopGenerating}
+        isGenerating={isGenerating}
+        picking={picking}
+        visionEnabled={visionEnabled}
+        editing={!!editingId}
+        onCancelEdit={() => {
+          setEditingId(null);
+          setDraft('');
+        }}
+        error={pickError}
+      />
+
+      <Sheet
+        visible={switcherOpen}
+        title="Model"
+        subtitle="One model is held in memory at a time; switching unloads the previous one."
+        onClose={() => setSwitcherOpen(false)}>
+        <SheetSection label="Ready on this device" />
+        {installed.map(m => (
+          <SheetRow
+            key={m.id}
+            icon="chip"
+            label={m.label}
+            detail={`${formatBytes(m.sizeBytes)}${
+              m.mmprojPath ? ' · sees images' : ''
+            }${m.external ? ' · outside the models folder' : ''}`}
+            selected={activeModel?.id === m.id}
+            onPress={() => {
+              setSwitcherOpen(false);
+              if (activeModel?.id !== m.id) loadModel(m);
+            }}
+          />
+        ))}
+        {installed.length === 0 && (
+          <SheetRow icon="info" label="No models installed yet" disabled />
+        )}
+        <SheetSection label="More" />
+        <SheetRow
+          icon="download"
+          label="Browse the catalog"
+          detail={`${MODEL_CATALOG.length} models with direct download links, from 400 MB upwards.`}
+          onPress={() => {
+            setSwitcherOpen(false);
+            onOpenModels();
+          }}
+        />
+      </Sheet>
     </KeyboardAvoidingView>
   );
 }
 
-const styles = StyleSheet.create({
+const useStyles = makeStyles(c => ({
   flex: { flex: 1 },
   center: {
     flex: 1,
@@ -278,16 +374,24 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     paddingHorizontal: spacing.xl,
   },
-  centerEmoji: { fontSize: 38, marginBottom: spacing.md },
+  badge: {
+    width: 64,
+    height: 64,
+    borderRadius: radius.pill,
+    backgroundColor: c.accentSoft,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  badgeBad: { backgroundColor: c.dangerSoft },
   centerTitle: {
-    color: colors.textPrimary,
+    color: c.textPrimary,
     fontSize: fontSizes.lg,
     fontWeight: '700',
-    marginTop: spacing.md,
+    marginTop: spacing.lg,
     textAlign: 'center',
   },
   centerBody: {
-    color: colors.textSecondary,
+    color: c.textSecondary,
     fontSize: fontSizes.sm,
     lineHeight: 20,
     textAlign: 'center',
@@ -295,103 +399,80 @@ const styles = StyleSheet.create({
     maxWidth: 460,
   },
   centerHint: {
-    color: colors.textFaint,
+    color: c.textFaint,
     fontSize: fontSizes.xs,
     lineHeight: 18,
     textAlign: 'center',
     marginTop: spacing.lg,
     maxWidth: 420,
   },
+  readyList: { alignSelf: 'stretch', marginTop: spacing.lg, maxWidth: 460 },
+  readyRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.md,
+    backgroundColor: c.surface,
+    borderWidth: 1,
+    borderColor: c.borderSoft,
+    borderRadius: radius.md,
+    padding: spacing.md,
+    marginBottom: spacing.sm,
+  },
+  readyName: { color: c.textPrimary, fontSize: fontSizes.sm, fontWeight: '600' },
+  readyMeta: { color: c.textFaint, fontSize: fontSizes.xxs, marginTop: 1 },
+  readyAction: { color: c.accent, fontSize: fontSizes.xs, fontWeight: '700' },
+  pressed: { opacity: 0.7 },
   primaryBtn: {
-    backgroundColor: colors.accent,
+    backgroundColor: c.accent,
     borderRadius: radius.sm,
     paddingVertical: spacing.md,
     paddingHorizontal: spacing.xl,
-    marginTop: spacing.xl,
+    marginTop: spacing.lg,
   },
-  primaryBtnText: {
-    color: colors.onAccent,
-    fontWeight: '700',
-    fontSize: fontSizes.sm,
-  },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: spacing.lg,
-    paddingBottom: spacing.md,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.borderSoft,
-    backgroundColor: colors.background,
-  },
-  headerText: { flex: 1, minWidth: 0 },
-  headerTitle: {
-    color: colors.textPrimary,
-    fontSize: fontSizes.md,
-    fontWeight: '700',
-  },
-  headerSub: { color: colors.textFaint, fontSize: fontSizes.xxs, marginTop: 1 },
-  headerActions: { flexDirection: 'row', gap: spacing.lg },
-  headerAction: {
-    color: colors.textSecondary,
-    fontSize: fontSizes.xs,
-    fontWeight: '600',
-  },
+  primaryBtnText: { color: c.onAccent, fontWeight: '700', fontSize: fontSizes.sm },
   listContent: { paddingVertical: spacing.lg },
   listEmpty: { flexGrow: 1, justifyContent: 'center' },
   emptyChat: { alignItems: 'center', paddingHorizontal: spacing.xl },
-  attachStrip: {
-    maxHeight: 78,
-    borderTopWidth: 1,
-    borderTopColor: colors.borderSoft,
+  emptyTitle: {
+    color: c.textPrimary,
+    fontSize: fontSizes.xl,
+    fontWeight: '700',
+    textAlign: 'center',
   },
-  attachStripContent: {
-    paddingHorizontal: spacing.lg,
-    paddingTop: spacing.sm,
+  emptyBody: {
+    color: c.textSecondary,
+    fontSize: fontSizes.sm,
+    lineHeight: 20,
+    textAlign: 'center',
+    marginTop: spacing.sm,
+    maxWidth: 420,
   },
-  pickError: {
-    color: colors.danger,
-    fontSize: fontSizes.xs,
-    paddingHorizontal: spacing.lg,
-    paddingBottom: spacing.xs,
+  suggestions: {
+    marginTop: spacing.xl,
+    alignSelf: 'stretch',
+    maxWidth: 460,
+    gap: spacing.sm,
   },
-  composer: {
-    borderTopWidth: 1,
-    borderTopColor: colors.borderSoft,
-    backgroundColor: colors.surface,
+  suggestion: {
+    backgroundColor: c.surface,
+    borderWidth: 1,
+    borderColor: c.borderSoft,
+    borderRadius: radius.md,
     paddingHorizontal: spacing.md,
-    paddingTop: spacing.sm,
+    paddingVertical: spacing.md,
   },
-  composerRow: { flexDirection: 'row', alignItems: 'flex-end', gap: spacing.sm },
-  iconBtn: {
-    width: 40,
-    height: 40,
+  suggestionText: { color: c.textSecondary, fontSize: fontSizes.sm },
+  jump: {
+    position: 'absolute',
+    bottom: spacing.lg,
+    alignSelf: 'center',
+    width: 38,
+    height: 38,
     borderRadius: radius.pill,
-    backgroundColor: colors.surfaceAlt,
+    backgroundColor: c.surfaceHigh,
+    borderWidth: 1,
+    borderColor: c.borderSoft,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  iconBtnText: { color: colors.textSecondary, fontSize: 19 },
-  input: {
-    flex: 1,
-    color: colors.textPrimary,
-    backgroundColor: colors.surfaceAlt,
-    borderRadius: radius.lg,
-    paddingHorizontal: spacing.lg,
-    paddingVertical: Platform.OS === 'ios' ? spacing.md : spacing.sm,
-    minHeight: 40,
-    maxHeight: 140,
-    fontSize: fontSizes.md,
-  },
-  sendBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: radius.pill,
-    backgroundColor: colors.accent,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  sendBtnDisabled: { backgroundColor: colors.accentMuted },
-  sendBtnText: { color: colors.onAccent, fontSize: 20, fontWeight: '700' },
-  stopBtn: { backgroundColor: colors.danger },
-  stopBtnText: { color: '#fff', fontSize: 14 },
-});
+}));

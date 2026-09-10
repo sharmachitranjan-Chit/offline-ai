@@ -1,36 +1,35 @@
 import React, { useEffect, useState } from 'react';
-import {
-  Alert,
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Switch,
-  Text,
-  TextInput,
-  View,
-} from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useLlama } from '../context/LlamaContext';
+import { Pressable, ScrollView, Switch, Text, TextInput, View } from 'react-native';
+import Icon, { IconName } from '../components/Icon';
+import StorageCard from '../components/StorageCard';
+import TopBar from '../components/TopBar';
+import { DEFAULT_SETTINGS, useLlama } from '../context/LlamaContext';
+import { ThemeMode, makeStyles, useColors, useTheme } from '../context/ThemeContext';
 import { DeviceInfo, DocKit } from '../native/DocKit';
 import { formatBytes } from '../services/modelManager';
-import { clearLog, readLog } from '../services/diagnostics';
-import { colors, fontSizes, radius, spacing, useLayout } from '../theme';
+import { fontSizes, radius, spacing, useLayout } from '../theme';
 
-export default function SettingsScreen() {
+const APPEARANCE: Array<{ mode: ThemeMode; label: string; icon: IconName }> = [
+  { mode: 'system', label: 'System', icon: 'phone' },
+  { mode: 'light', label: 'Light', icon: 'sun' },
+  { mode: 'dark', label: 'Dark', icon: 'moon' },
+];
+
+export default function SettingsScreen({ onBack }: { onBack: () => void }) {
   const {
     settings,
     updateSettings,
-    resetSettings,
-    tuneForDevice,
     activeModel,
     visionEnabled,
     unloadModel,
+    refreshInstalled,
   } = useLlama();
-  const insets = useSafeAreaInsets();
+  const { mode, setMode } = useTheme();
+  const c = useColors();
+  const styles = useStyles();
   const layout = useLayout();
   const [device, setDevice] = useState<DeviceInfo | null>(null);
   const [prompt, setPrompt] = useState(settings.systemPrompt);
-  const [logPreview, setLogPreview] = useState('');
 
   useEffect(() => {
     DocKit.getDeviceInfo().then(setDevice);
@@ -40,251 +39,230 @@ export default function SettingsScreen() {
     setPrompt(settings.systemPrompt);
   }, [settings.systemPrompt]);
 
-  const refreshLogPreview = () => {
-    readLog().then(text => {
-      const lines = text.trim().split('\n');
-      setLogPreview(lines.slice(-12).join('\n'));
-    });
-  };
-
-  useEffect(() => {
-    refreshLogPreview();
-  }, []);
-
   return (
-    <ScrollView
-      contentContainerStyle={{
-        paddingTop: insets.top + spacing.md,
-        paddingHorizontal: layout.compact ? spacing.lg : spacing.xl,
-        paddingBottom: spacing.xxl,
-      }}>
-      <View style={{ maxWidth: layout.contentWidth, width: '100%', alignSelf: 'center' }}>
-        <Text style={styles.title}>Settings</Text>
+    <View style={styles.flex}>
+      <TopBar title="Settings" leading="back" onLeading={onBack} />
+      <ScrollView
+        contentContainerStyle={{
+          paddingTop: spacing.md,
+          paddingHorizontal: layout.compact ? spacing.lg : spacing.xl,
+          paddingBottom: spacing.xxl,
+        }}>
+        <View style={styles.column}>
+          <Section label="Appearance">
+            <View style={styles.field}>
+              <Text style={styles.fieldLabel}>Theme</Text>
+              <Text style={styles.help}>
+                System follows your phone, including its automatic day/night
+                schedule.
+              </Text>
+              <View style={styles.segment}>
+                {APPEARANCE.map(option => {
+                  const selected = mode === option.mode;
+                  return (
+                    <Pressable
+                      key={option.mode}
+                      onPress={() => setMode(option.mode)}
+                      style={[styles.segmentItem, selected && styles.segmentActive]}>
+                      <Icon
+                        name={option.icon}
+                        size={16}
+                        color={selected ? c.accent : c.textSecondary}
+                        background={selected ? c.accentSoft : c.surface}
+                      />
+                      <Text
+                        style={[
+                          styles.segmentText,
+                          selected && styles.segmentTextActive,
+                        ]}>
+                        {option.label}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            </View>
+          </Section>
 
-        <Pressable
-          style={styles.tuneBtn}
-          onPress={async () => {
-            const ok = await tuneForDevice();
-            Alert.alert(
-              ok ? 'Tuned' : 'Could not read device info',
-              ok
-                ? 'Context size, reply length, threads and image detail were set from this phone\u2019s current RAM and core count.'
-                : 'Try again in a moment.',
-            );
-          }}>
-          <Text style={styles.tuneBtnText}>⚙ Tune settings for this device</Text>
-          <Text style={styles.tuneBtnHelp}>
-            Sets context window, threads, reply length and image detail from
-            this phone's actual memory and cores — worth running again after
-            closing other apps, or any time things feel too heavy.
-          </Text>
-        </Pressable>
+          <Section label="Storage">
+            <StorageCard onChanged={refreshInstalled} showTitle={false} />
+          </Section>
 
-        <Section label="Instructions">
-          <Text style={styles.help}>
-            The system prompt shapes everything the model does. Unfiltered
-            models in particular tend to follow it closely rather than
-            imposing a personality of their own.
-          </Text>
-          <TextInput
-            style={styles.textArea}
-            value={prompt}
-            onChangeText={setPrompt}
-            onBlur={() => updateSettings({ systemPrompt: prompt })}
-            multiline
-            placeholder="System prompt"
-            placeholderTextColor={colors.textFaint}
-          />
-        </Section>
-
-        <Section label="Generation">
-          <Stepper
-            label="Temperature"
-            help="Lower is more literal and repeatable; higher is more varied."
-            value={settings.temperature}
-            step={0.1}
-            min={0}
-            max={2}
-            format={v => v.toFixed(1)}
-            onChange={v => updateSettings({ temperature: v })}
-          />
-          <Stepper
-            label="Top-p"
-            help="Narrows the pool of candidate words. 0.9 suits most models."
-            value={settings.topP}
-            step={0.05}
-            min={0.1}
-            max={1}
-            format={v => v.toFixed(2)}
-            onChange={v => updateSettings({ topP: v })}
-          />
-          <Stepper
-            label="Reply length limit"
-            help="Maximum tokens in one reply. Longer replies take proportionally longer and warm the phone more."
-            value={settings.maxTokens}
-            step={256}
-            min={256}
-            max={8192}
-            format={v => `${v}`}
-            onChange={v => updateSettings({ maxTokens: v })}
-          />
-        </Section>
-
-        <Section label="Performance">
-          <Stepper
-            label="CPU threads"
-            help={`Using every core is rarely fastest — the phone throttles. ${
-              device ? `This device reports ${device.cores} cores; ` : ''
-            }about half is usually the sweet spot.`}
-            value={settings.threads}
-            step={1}
-            min={1}
-            max={12}
-            format={v => `${v}`}
-            onChange={v => updateSettings({ threads: v })}
-          />
-          <Stepper
-            label="Context window"
-            help="How much conversation the model can see at once. Larger uses noticeably more RAM. Takes effect on the next model load."
-            value={settings.contextSize}
-            step={2048}
-            min={2048}
-            max={16384}
-            format={v => `${v / 1024}k`}
-            onChange={v => updateSettings({ contextSize: v })}
-          />
-          <Stepper
-            label="Image detail"
-            help="Tokens spent per image. Lower is much faster and cooler; raise it only when fine detail matters."
-            value={settings.imageMaxTokens}
-            step={128}
-            min={128}
-            max={2048}
-            format={v => `${v}`}
-            onChange={v => updateSettings({ imageMaxTokens: v })}
-          />
-        </Section>
-
-        <Section label="Display">
-          <Toggle
-            label="Full screen"
-            help="Hides the status and navigation bars. Swipe from an edge to bring them back."
-            value={settings.immersive}
-            onChange={v => updateSettings({ immersive: v })}
-          />
-          <Toggle
-            label="Keep screen on while generating"
-            help="Stops the display sleeping mid-reply. Turns itself off once generation finishes."
-            value={settings.keepScreenOn}
-            onChange={v => updateSettings({ keepScreenOn: v })}
-          />
-          <Toggle
-            label="Always show reasoning"
-            help="Reasoning models think before answering. By default that is folded away behind a toggle on each reply."
-            value={settings.showReasoning}
-            onChange={v => updateSettings({ showReasoning: v })}
-          />
-        </Section>
-
-        <Section label="Status">
-          <Row label="Loaded model" value={activeModel?.label ?? 'None'} />
-          <Row label="Image input" value={visionEnabled ? 'Available' : 'Not available'} />
-          {device && (
-            <>
-              <Row label="Device" value={device.model} />
-              <Row
-                label="Memory"
-                value={`${formatBytes(device.availRamBytes)} free of ${formatBytes(
-                  device.totalRamBytes,
-                )}`}
+          <Section label="Instructions">
+            <View style={styles.field}>
+              <Text style={styles.help}>
+                The system prompt shapes everything the model does. Unfiltered
+                models in particular tend to follow it closely rather than
+                imposing a personality of their own.
+              </Text>
+              <TextInput
+                style={styles.textArea}
+                value={prompt}
+                onChangeText={setPrompt}
+                onBlur={() => updateSettings({ systemPrompt: prompt })}
+                multiline
+                placeholder="System prompt"
+                placeholderTextColor={c.textFaint}
               />
-              <Row label="Storage free" value={formatBytes(device.freeDiskBytes)} />
-              <Row label="Downloads folder" value={device.downloadsDir} />
-            </>
-          )}
-          {!!activeModel && (
-            <Pressable onPress={unloadModel} style={styles.unload}>
-              <Text style={styles.unloadText}>Unload model and free memory</Text>
-            </Pressable>
-          )}
-        </Section>
+              <Pressable
+                onPress={() => {
+                  setPrompt(DEFAULT_SETTINGS.systemPrompt);
+                  updateSettings({ systemPrompt: DEFAULT_SETTINGS.systemPrompt });
+                }}>
+                <Text style={styles.link}>Reset to default</Text>
+              </Pressable>
+            </View>
+          </Section>
 
-        <Section label="Diagnostics">
-          <Text style={styles.help}>
-            A running log of loads, generations, and errors — kept locally so
-            a crash or a stuck screen can be diagnosed from evidence instead
-            of a guess. Nothing here ever leaves the device.
+          <Section label="Generation">
+            <Stepper
+              label="Temperature"
+              help="Lower is more literal and repeatable; higher is more varied."
+              value={settings.temperature}
+              step={0.1}
+              min={0}
+              max={2}
+              format={v => v.toFixed(1)}
+              onChange={v => updateSettings({ temperature: v })}
+            />
+            <Stepper
+              label="Top-p"
+              help="Narrows the pool of candidate words. 0.9 suits most models."
+              value={settings.topP}
+              step={0.05}
+              min={0.1}
+              max={1}
+              format={v => v.toFixed(2)}
+              onChange={v => updateSettings({ topP: v })}
+            />
+            <Stepper
+              label="Reply length limit"
+              help="Maximum tokens in one reply. Longer replies take proportionally longer and warm the phone more."
+              value={settings.maxTokens}
+              step={256}
+              min={256}
+              max={4096}
+              format={v => `${v}`}
+              onChange={v => updateSettings({ maxTokens: v })}
+            />
+          </Section>
+
+          <Section label="Performance">
+            <Stepper
+              label="CPU threads"
+              help={`Using every core is rarely fastest — the phone throttles. ${
+                device ? `This device reports ${device.cores} cores; ` : ''
+              }about half is usually the sweet spot.`}
+              value={settings.threads}
+              step={1}
+              min={1}
+              max={12}
+              format={v => `${v}`}
+              onChange={v => updateSettings({ threads: v })}
+            />
+            <Stepper
+              label="Context window"
+              help="How much conversation the model can see at once. Larger uses noticeably more RAM. Takes effect on the next model load."
+              value={settings.contextSize}
+              step={2048}
+              min={2048}
+              max={16384}
+              format={v => `${v / 1024}k`}
+              onChange={v => updateSettings({ contextSize: v })}
+            />
+            <Stepper
+              label="Image detail"
+              help="Tokens spent per image. Lower is much faster and cooler; raise it only when fine detail matters."
+              value={settings.imageMaxTokens}
+              step={128}
+              min={128}
+              max={2048}
+              format={v => `${v}`}
+              onChange={v => updateSettings({ imageMaxTokens: v })}
+            />
+          </Section>
+
+          <Section label="Behaviour">
+            <Toggle
+              label="Reopen the last model on start"
+              help="Loads whatever you used last as soon as the app opens, so it is ready without a trip to the Models screen."
+              value={settings.autoLoadLastModel}
+              onChange={v => updateSettings({ autoLoadLastModel: v })}
+            />
+            <Toggle
+              label="Always show reasoning"
+              help="Reasoning models think before answering. By default that is folded away behind a button on each reply."
+              value={settings.showReasoning}
+              onChange={v => updateSettings({ showReasoning: v })}
+            />
+            <Toggle
+              label="Show speed under replies"
+              help="Tokens per second for each completed answer."
+              value={settings.showStats}
+              onChange={v => updateSettings({ showStats: v })}
+            />
+            <Toggle
+              label="Full screen"
+              help="Hides the status and navigation bars. Swipe from an edge to bring them back."
+              value={settings.immersive}
+              onChange={v => updateSettings({ immersive: v })}
+            />
+            <Toggle
+              label="Keep screen on while generating"
+              help="Stops the display sleeping mid-reply. Turns itself off once generation finishes."
+              value={settings.keepScreenOn}
+              onChange={v => updateSettings({ keepScreenOn: v })}
+            />
+          </Section>
+
+          <Section label="Status">
+            <View style={styles.field}>
+              <Row label="Loaded model" value={activeModel?.label ?? 'None'} />
+              <Row
+                label="Image input"
+                value={visionEnabled ? 'Available' : 'Not available'}
+              />
+              {device && (
+                <>
+                  <Row label="Device" value={device.model} />
+                  <Row label="Android API" value={`${device.sdk}`} />
+                  <Row
+                    label="Memory"
+                    value={`${formatBytes(device.availRamBytes)} free of ${formatBytes(
+                      device.totalRamBytes,
+                    )}`}
+                  />
+                  <Row
+                    label="Shared storage free"
+                    value={formatBytes(device.freeSharedBytes)}
+                  />
+                  <Row
+                    label="All-files access"
+                    value={device.allFilesAccess ? 'Granted' : 'Not granted'}
+                  />
+                </>
+              )}
+              {!!activeModel && (
+                <Pressable onPress={unloadModel} style={styles.unload}>
+                  <Text style={styles.unloadText}>Unload model and free memory</Text>
+                </Pressable>
+              )}
+            </View>
+          </Section>
+
+          <Text style={styles.footer}>
+            No account, no telemetry, no network calls during inference. The only
+            time this app uses the internet is when you ask it to fetch a model
+            file.
           </Text>
-          <View style={styles.logBox}>
-            <Text style={styles.logText} numberOfLines={14}>
-              {logPreview || 'Nothing logged yet.'}
-            </Text>
-          </View>
-          <View style={styles.diagRow}>
-            <Pressable
-              style={styles.diagBtn}
-              onPress={async () => {
-                const full = await readLog();
-                DocKit.setClipboard(full);
-                Alert.alert('Copied', 'The full diagnostics log is on your clipboard.');
-              }}>
-              <Text style={styles.diagBtnText}>Copy full log</Text>
-            </Pressable>
-            <Pressable
-              style={styles.diagBtn}
-              onPress={refreshLogPreview}>
-              <Text style={styles.diagBtnText}>Refresh</Text>
-            </Pressable>
-            <Pressable
-              style={styles.diagBtn}
-              onPress={() =>
-                Alert.alert('Clear diagnostics log?', undefined, [
-                  { text: 'Cancel', style: 'cancel' },
-                  {
-                    text: 'Clear',
-                    style: 'destructive',
-                    onPress: async () => {
-                      await clearLog();
-                      refreshLogPreview();
-                    },
-                  },
-                ])
-              }>
-              <Text style={styles.diagBtnText}>Clear</Text>
-            </Pressable>
-          </View>
-        </Section>
-
-        <Pressable
-          style={styles.resetAllBtn}
-          onPress={() =>
-            Alert.alert(
-              'Reset all settings?',
-              'This puts every value on this screen back to its default. Your models and conversation are not affected.',
-              [
-                { text: 'Cancel', style: 'cancel' },
-                {
-                  text: 'Reset',
-                  style: 'destructive',
-                  onPress: () => resetSettings(),
-                },
-              ],
-            )
-          }>
-          <Text style={styles.resetAllText}>Reset all settings to default</Text>
-        </Pressable>
-
-        <Text style={styles.footer}>
-          No account, no telemetry, no network calls during inference. The only
-          time this app uses the internet is when you ask it to fetch a model
-          file.
-        </Text>
-      </View>
-    </ScrollView>
+        </View>
+      </ScrollView>
+    </View>
   );
 }
 
 function Section({ label, children }: { label: string; children: React.ReactNode }) {
+  const styles = useStyles();
   return (
     <View style={styles.section}>
       <Text style={styles.sectionLabel}>{label}</Text>
@@ -312,6 +290,8 @@ function Stepper({
   format: (v: number) => string;
   onChange: (v: number) => void;
 }) {
+  const c = useColors();
+  const styles = useStyles();
   const clamp = (v: number) => Math.min(max, Math.max(min, Number(v.toFixed(4))));
   return (
     <View style={styles.field}>
@@ -322,14 +302,14 @@ function Stepper({
             style={styles.stepBtn}
             onPress={() => onChange(clamp(value - step))}
             hitSlop={6}>
-            <Text style={styles.stepBtnText}>−</Text>
+            <Icon name="minus" size={13} color={c.textPrimary} />
           </Pressable>
           <Text style={styles.stepValue}>{format(value)}</Text>
           <Pressable
             style={styles.stepBtn}
             onPress={() => onChange(clamp(value + step))}
             hitSlop={6}>
-            <Text style={styles.stepBtnText}>+</Text>
+            <Icon name="plus" size={13} color={c.textPrimary} />
           </Pressable>
         </View>
       </View>
@@ -349,6 +329,8 @@ function Toggle({
   value: boolean;
   onChange: (v: boolean) => void;
 }) {
+  const c = useColors();
+  const styles = useStyles();
   return (
     <View style={styles.field}>
       <View style={styles.fieldRow}>
@@ -356,8 +338,8 @@ function Toggle({
         <Switch
           value={value}
           onValueChange={onChange}
-          trackColor={{ false: colors.surfaceHigh, true: colors.accentMuted }}
-          thumbColor={value ? colors.accent : colors.textFaint}
+          trackColor={{ false: c.surfaceHigh, true: c.accentMuted }}
+          thumbColor={value ? c.accent : c.textFaint}
         />
       </View>
       <Text style={styles.help}>{help}</Text>
@@ -366,6 +348,7 @@ function Toggle({
 }
 
 function Row({ label, value }: { label: string; value: string }) {
+  const styles = useStyles();
   return (
     <View style={styles.statusRow}>
       <Text style={styles.statusLabel}>{label}</Text>
@@ -376,34 +359,12 @@ function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
-const styles = StyleSheet.create({
-  title: {
-    color: colors.textPrimary,
-    fontSize: fontSizes.xxl,
-    fontWeight: '700',
-  },
+const useStyles = makeStyles(c => ({
+  flex: { flex: 1 },
+  column: { maxWidth: 760, width: '100%', alignSelf: 'center' },
   section: { marginTop: spacing.xl },
-  tuneBtn: {
-    marginTop: spacing.lg,
-    backgroundColor: colors.accentSoft,
-    borderRadius: radius.sm,
-    borderWidth: 1,
-    borderColor: colors.accentMuted,
-    padding: spacing.md,
-  },
-  tuneBtnText: {
-    color: colors.accent,
-    fontSize: fontSizes.sm,
-    fontWeight: '700',
-  },
-  tuneBtnHelp: {
-    color: colors.textSecondary,
-    fontSize: fontSizes.xxs,
-    lineHeight: 16,
-    marginTop: spacing.xs,
-  },
   sectionLabel: {
-    color: colors.textFaint,
+    color: c.textFaint,
     fontSize: fontSizes.xxs,
     fontWeight: '700',
     letterSpacing: 0.8,
@@ -411,10 +372,10 @@ const styles = StyleSheet.create({
     marginBottom: spacing.md,
   },
   field: {
-    backgroundColor: colors.surface,
-    borderRadius: radius.sm,
+    backgroundColor: c.surface,
+    borderRadius: radius.md,
     borderWidth: 1,
-    borderColor: colors.borderSoft,
+    borderColor: c.borderSoft,
     padding: spacing.md,
     marginBottom: spacing.sm,
   },
@@ -424,39 +385,58 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   fieldLabel: {
-    color: colors.textPrimary,
+    color: c.textPrimary,
     fontSize: fontSizes.sm,
     fontWeight: '600',
     flex: 1,
     marginRight: spacing.md,
   },
   help: {
-    color: colors.textFaint,
+    color: c.textFaint,
     fontSize: fontSizes.xxs,
     lineHeight: 17,
     marginTop: spacing.xs,
   },
+  segment: {
+    flexDirection: 'row',
+    backgroundColor: c.surfaceAlt,
+    borderRadius: radius.md,
+    padding: 3,
+    marginTop: spacing.md,
+    gap: 3,
+  },
+  segmentItem: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.sm,
+    paddingVertical: spacing.sm + 2,
+    borderRadius: radius.sm,
+  },
+  segmentActive: { backgroundColor: c.accentSoft },
+  segmentText: { color: c.textSecondary, fontSize: fontSizes.sm, fontWeight: '600' },
+  segmentTextActive: { color: c.accent },
   stepper: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
   stepBtn: {
     width: 30,
     height: 30,
     borderRadius: radius.pill,
-    backgroundColor: colors.surfaceHigh,
+    backgroundColor: c.surfaceHigh,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  stepBtnText: { color: colors.textPrimary, fontSize: 17, fontWeight: '700' },
   stepValue: {
-    color: colors.accent,
+    color: c.accent,
     fontSize: fontSizes.sm,
     fontWeight: '700',
     minWidth: 46,
     textAlign: 'center',
   },
   textArea: {
-    backgroundColor: colors.surfaceAlt,
+    backgroundColor: c.surfaceAlt,
     borderRadius: radius.sm,
-    color: colors.textPrimary,
+    color: c.textPrimary,
     fontSize: fontSizes.sm,
     lineHeight: 20,
     padding: spacing.md,
@@ -465,7 +445,7 @@ const styles = StyleSheet.create({
     marginTop: spacing.sm,
   },
   link: {
-    color: colors.accent,
+    color: c.accent,
     fontSize: fontSizes.xs,
     fontWeight: '600',
     marginTop: spacing.sm,
@@ -476,60 +456,28 @@ const styles = StyleSheet.create({
     gap: spacing.lg,
     paddingVertical: spacing.sm,
     borderBottomWidth: 1,
-    borderBottomColor: colors.borderSoft,
+    borderBottomColor: c.borderSoft,
   },
-  statusLabel: { color: colors.textSecondary, fontSize: fontSizes.xs },
+  statusLabel: { color: c.textSecondary, fontSize: fontSizes.xs },
   statusValue: {
-    color: colors.textPrimary,
+    color: c.textPrimary,
     fontSize: fontSizes.xs,
     fontWeight: '600',
     flexShrink: 1,
     textAlign: 'right',
   },
-  logBox: {
-    backgroundColor: colors.code,
-    borderRadius: radius.sm,
-    borderWidth: 1,
-    borderColor: colors.borderSoft,
-    padding: spacing.md,
-    marginTop: spacing.sm,
-  },
-  logText: {
-    color: colors.textSecondary,
-    fontSize: fontSizes.xxs,
-    lineHeight: 15,
-    fontFamily: 'monospace',
-  },
-  diagRow: { flexDirection: 'row', gap: spacing.sm, marginTop: spacing.sm },
-  diagBtn: {
-    backgroundColor: colors.surfaceHigh,
-    borderRadius: radius.sm,
-    paddingVertical: spacing.sm,
-    paddingHorizontal: spacing.md,
-  },
-  diagBtnText: { color: colors.textPrimary, fontSize: fontSizes.xs, fontWeight: '600' },
-  resetAllBtn: {
-    marginTop: spacing.xl,
-    backgroundColor: colors.surface,
-    borderRadius: radius.sm,
-    borderWidth: 1,
-    borderColor: colors.borderSoft,
-    padding: spacing.md,
-    alignItems: 'center',
-  },
-  resetAllText: { color: colors.textSecondary, fontSize: fontSizes.sm, fontWeight: '600' },
   unload: {
     marginTop: spacing.md,
-    backgroundColor: colors.dangerSoft,
+    backgroundColor: c.dangerSoft,
     borderRadius: radius.sm,
     padding: spacing.md,
     alignItems: 'center',
   },
-  unloadText: { color: colors.danger, fontSize: fontSizes.sm, fontWeight: '600' },
+  unloadText: { color: c.danger, fontSize: fontSizes.sm, fontWeight: '600' },
   footer: {
-    color: colors.textFaint,
+    color: c.textFaint,
     fontSize: fontSizes.xs,
     lineHeight: 18,
     marginTop: spacing.xl,
   },
-});
+}));

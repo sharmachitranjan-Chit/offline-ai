@@ -1,10 +1,12 @@
 package com.offlineai.dockit
 
+import android.Manifest
 import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.pdf.PdfRenderer
@@ -14,6 +16,8 @@ import android.os.Environment
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -45,8 +49,10 @@ import java.util.zip.ZipInputStream
  *      actually consume: downscaled JPEGs, or extracted plain text.
  *   3. Resumable model downloads over HTTP Range, so a flaky connection
  *      continues where it stopped instead of starting from zero.
- *   4. Finding .gguf files the user downloaded themselves.
- *   5. Small system bits: clipboard, immersive mode, device RAM.
+ *   4. Finding .gguf files the user downloaded themselves, and keeping them
+ *      in a folder other apps can read rather than in app-private storage.
+ *   5. Small system bits: clipboard, immersive mode, device RAM, system bar
+ *      colours.
  */
 class DocKitModule(private val ctx: ReactApplicationContext) :
     ReactContextBaseJavaModule(ctx), ActivityEventListener {
@@ -242,13 +248,16 @@ class DocKitModule(private val ctx: ReactApplicationContext) :
         return null
     }
 
-    private fun candidateDirs(): List<File> = listOfNotNull(
-        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS),
-        File(Environment.getExternalStorageDirectory(), "Download"),
-        File(Environment.getExternalStorageDirectory(), "Models"),
-        ctx.getExternalFilesDir(null)
-    ).filter { it.isDirectory }
+    private fun candidateDirs(): List<File> = (
+        storageCandidates().map { it.dir } + listOfNotNull(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS),
+            File(Environment.getExternalStorageDirectory(), "Download"),
+            File(Environment.getExternalStorageDirectory(), "Models"),
+            File(Environment.getExternalStorageDirectory(), "AI"),
+            ctx.getExternalFilesDir(null)
+        )
+        ).distinctBy { it.absolutePath }.filter { it.isDirectory }
 
     private fun cacheDir(sub: String): File =
         File(ctx.cacheDir, sub).also { it.mkdirs() }
@@ -638,6 +647,300 @@ class DocKitModule(private val ctx: ReactApplicationContext) :
         }
     }
 
+    // ---------------------------------------------------------------
+    // 4b. Where models are kept
+    // ---------------------------------------------------------------
+
+    /**
+     * Model files belong in shared storage, not inside the app.
+     *
+     * A 3 GB .gguf in app-private storage is invisible to every other app on
+     * the phone and disappears with an uninstall, so anyone running a second
+     * local-AI app ends up downloading the same weights twice. A plain folder
+     * on internal storage is readable by any app the user points at it, and
+     * llama.cpp is happy because it is a real path it can mmap.
+     *
+     * The cost is that shared folders need all-files access on Android 11+.
+     * The app therefore offers every location it can actually use, says
+     * which ones are writable right now, and lets the user choose — falling
+     * back to its own external folder when no permission is granted.
+     */
+
+    private data class StorageCandidate(
+        val id: String,
+        val label: String,
+        val dir: File,
+        /** True when other apps can read this path. */
+        val shared: Boolean,
+        val needsAllFiles: Boolean,
+        val removable: Boolean = false,
+    )
+
+    private val MODELS_FOLDER = "AIModels"
+
+    private fun storageCandidates(): List<StorageCandidate> {
+        val out = mutableListOf<StorageCandidate>()
+        val ext = Environment.getExternalStorageDirectory()
+
+        out.add(
+            StorageCandidate(
+                "shared-root", "Internal storage · /$MODELS_FOLDER",
+                File(ext, MODELS_FOLDER), shared = true, needsAllFiles = true
+            )
+        )
+        out.add(
+            StorageCandidate(
+                "shared-documents", "Documents · /$MODELS_FOLDER",
+                File(
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS),
+                    MODELS_FOLDER
+                ),
+                shared = true, needsAllFiles = true
+            )
+        )
+        out.add(
+            StorageCandidate(
+                "shared-download", "Download · /$MODELS_FOLDER",
+                File(
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                    MODELS_FOLDER
+                ),
+                shared = true, needsAllFiles = true
+            )
+        )
+
+        // Removable card, when the device has one mounted.
+        val volumes = try {
+            ctx.getExternalFilesDirs(null).filterNotNull()
+        } catch (_: Throwable) {
+            emptyList()
+        }
+        volumes.drop(1).forEachIndexed { i, appDir ->
+            val root = appDir.absolutePath.substringBefore("/Android/data")
+            if (root.isNotBlank() && root != appDir.absolutePath) {
+                out.add(
+                    StorageCandidate(
+                        "sdcard-$i", "SD card · /$MODELS_FOLDER",
+                        File(root, MODELS_FOLDER),
+                        shared = true, needsAllFiles = true, removable = true
+                    )
+                )
+            }
+            out.add(
+                StorageCandidate(
+                    "sdcard-app-$i", "SD card · app folder",
+                    File(appDir, "models"),
+                    shared = false, needsAllFiles = false, removable = true
+                )
+            )
+        }
+
+        ctx.getExternalFilesDir(null)?.let {
+            out.add(
+                StorageCandidate(
+                    "app-external", "App folder (no permission needed)",
+                    File(it, "models"), shared = false, needsAllFiles = false
+                )
+            )
+        }
+        out.add(
+            StorageCandidate(
+                "app-internal", "App private storage",
+                File(ctx.filesDir, "models"), shared = false, needsAllFiles = false
+            )
+        )
+        return out
+    }
+
+    private fun allFilesGranted(): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else {
+            ContextCompat.checkSelfPermission(
+                ctx, Manifest.permission.WRITE_EXTERNAL_STORAGE
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+
+    /** Bytes free on the volume holding [file], walking up to a real parent. */
+    private fun freeSpaceOf(file: File): Long {
+        var f: File? = file
+        while (f != null && !f.exists()) f = f.parentFile
+        return try {
+            f?.usableSpace ?: 0L
+        } catch (_: Throwable) {
+            0L
+        }
+    }
+
+    private fun countGguf(dir: File): Int = try {
+        if (!dir.isDirectory) 0
+        else dir.listFiles()?.count { it.isFile && it.name.endsWith(".gguf", true) } ?: 0
+    } catch (_: Throwable) {
+        0
+    }
+
+    @ReactMethod
+    fun getStorageOptions(promise: Promise) {
+        io.execute {
+            val granted = allFilesGranted()
+            val out = Arguments.createArray()
+            for (c in storageCandidates()) {
+                val usable = !c.needsAllFiles || granted
+                out.pushMap(Arguments.createMap().apply {
+                    putString("id", c.id)
+                    putString("label", c.label)
+                    putString("path", c.dir.absolutePath)
+                    putBoolean("shared", c.shared)
+                    putBoolean("removable", c.removable)
+                    putBoolean("needsAllFiles", c.needsAllFiles)
+                    putBoolean("writable", usable)
+                    putBoolean("exists", c.dir.isDirectory)
+                    putInt("modelCount", countGguf(c.dir))
+                    putDouble("freeBytes", freeSpaceOf(c.dir).toDouble())
+                })
+            }
+            promise.resolve(out)
+        }
+    }
+
+    /**
+     * Creates a folder and proves it is really writable by putting a byte in
+     * it. `canWrite()` lies on scoped storage — it can report true for a path
+     * the first write then fails on — and finding that out halfway through a
+     * 3 GB download is the worst possible time.
+     */
+    @ReactMethod
+    fun ensureDir(path: String, promise: Promise) {
+        io.execute {
+            val result = Arguments.createMap()
+            try {
+                val dir = File(path)
+                if (!dir.exists() && !dir.mkdirs()) {
+                    result.putBoolean("ok", false)
+                    result.putString(
+                        "message",
+                        if (!allFilesGranted())
+                            "Android blocked that folder. Grant all-files access, or choose the app folder instead."
+                        else "Could not create that folder."
+                    )
+                    promise.resolve(result); return@execute
+                }
+                val probe = File(dir, ".offlineai-write-test")
+                FileOutputStream(probe).use { it.write(1) }
+                probe.delete()
+                result.putBoolean("ok", true)
+                result.putDouble("freeBytes", freeSpaceOf(dir).toDouble())
+            } catch (e: Throwable) {
+                result.putBoolean("ok", false)
+                result.putString(
+                    "message",
+                    e.message ?: "That folder cannot be written to."
+                )
+            }
+            promise.resolve(result)
+        }
+    }
+
+    /**
+     * Moves a file, falling back to copy-then-delete across volumes.
+     * `renameTo` cannot cross a filesystem boundary, which is exactly what
+     * migrating out of app storage onto shared storage does.
+     */
+    @ReactMethod
+    fun moveFile(from: String, to: String, promise: Promise) {
+        io.execute {
+            try {
+                val src = File(from)
+                if (!src.exists()) {
+                    promise.reject("missing", "$from is not there any more."); return@execute
+                }
+                val dest = File(to)
+                dest.parentFile?.mkdirs()
+                if (dest.exists()) dest.delete()
+                if (src.renameTo(dest)) {
+                    promise.resolve(dest.absolutePath); return@execute
+                }
+                src.inputStream().use { input ->
+                    FileOutputStream(dest).use { input.copyTo(it, 1 shl 20) }
+                }
+                if (dest.length() != src.length()) {
+                    dest.delete()
+                    promise.reject("short_copy", "The copy came out the wrong size; nothing was deleted.")
+                    return@execute
+                }
+                src.delete()
+                promise.resolve(dest.absolutePath)
+            } catch (e: Throwable) {
+                promise.reject("move_failed", e.message ?: "Could not move the file.", e)
+            }
+        }
+    }
+
+    /** Every .gguf under one folder — used to pick up files dropped in by hand. */
+    @ReactMethod
+    fun listGguf(path: String, promise: Promise) {
+        io.execute {
+            val out = Arguments.createArray()
+            try {
+                val dir = File(path)
+                if (dir.isDirectory) {
+                    dir.walkTopDown().maxDepth(3).forEach { f ->
+                        if (f.isFile && f.name.endsWith(".gguf", true)) {
+                            out.pushMap(Arguments.createMap().apply {
+                                putString("path", f.absolutePath)
+                                putString("name", f.name)
+                                putDouble("size", f.length().toDouble())
+                                putBoolean("isMmproj", f.name.contains("mmproj", true))
+                            })
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+            promise.resolve(out)
+        }
+    }
+
+    @ReactMethod
+    fun deleteFile(path: String, promise: Promise) {
+        io.execute {
+            try {
+                val f = File(path)
+                promise.resolve(!f.exists() || f.delete())
+            } catch (e: Throwable) {
+                promise.reject("delete_failed", e.message ?: "Could not delete that file.", e)
+            }
+        }
+    }
+
+    @ReactMethod
+    fun freeSpace(path: String, promise: Promise) {
+        promise.resolve(freeSpaceOf(File(path)).toDouble())
+    }
+
+    /** Runtime storage permission, for phones older than Android 11. */
+    @ReactMethod
+    fun requestLegacyStoragePermission(promise: Promise) {
+        val activity = ctx.currentActivity
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R || activity == null) {
+            promise.resolve(false)
+            return
+        }
+        try {
+            ActivityCompat.requestPermissions(
+                activity,
+                arrayOf(
+                    Manifest.permission.READ_EXTERNAL_STORAGE,
+                    Manifest.permission.WRITE_EXTERNAL_STORAGE
+                ),
+                0xD0C2
+            )
+            promise.resolve(true)
+        } catch (e: Throwable) {
+            promise.reject("no_permission_ui", e.message ?: "Could not ask for permission.", e)
+        }
+    }
+
     @ReactMethod
     fun copyToModels(uriString: String, fileName: String, destDir: String, promise: Promise) {
         io.execute {
@@ -699,6 +1002,33 @@ class DocKitModule(private val ctx: ReactApplicationContext) :
         }
     }
 
+    /**
+     * Paints the status and navigation bars to match the app's theme.
+     *
+     * Without this, light mode gets white icons on a white bar — the theme
+     * switch looks half-finished exactly where the eye lands first.
+     */
+    @ReactMethod
+    fun setSystemBars(colorHex: String, darkTheme: Boolean) {
+        val activity = ctx.currentActivity ?: return
+        activity.runOnUiThread {
+            try {
+                val window = activity.window
+                val color = Color.parseColor(colorHex)
+                @Suppress("DEPRECATION")
+                window.statusBarColor = color
+                @Suppress("DEPRECATION")
+                window.navigationBarColor = color
+                val controller = WindowInsetsControllerCompat(window, window.decorView)
+                // "Appearance light bars" means dark icons on a light bar.
+                controller.isAppearanceLightStatusBars = !darkTheme
+                controller.isAppearanceLightNavigationBars = !darkTheme
+            } catch (_: Throwable) {
+                // A malformed colour or an exotic OEM window shouldn't crash the app.
+            }
+        }
+    }
+
     @ReactMethod
     fun setKeepScreenOn(enabled: Boolean) {
         val activity = ctx.currentActivity ?: return
@@ -727,15 +1057,17 @@ class DocKitModule(private val ctx: ReactApplicationContext) :
                 Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).absolutePath
             )
             putDouble("freeDiskBytes", ctx.filesDir.usableSpace.toDouble())
+            putDouble(
+                "freeSharedBytes",
+                freeSpaceOf(Environment.getExternalStorageDirectory()).toDouble()
+            )
+            putBoolean("allFilesAccess", allFilesGranted())
         })
     }
 
     @ReactMethod
     fun hasAllFilesAccess(promise: Promise) {
-        promise.resolve(
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Environment.isExternalStorageManager()
-            else true
-        )
+        promise.resolve(allFilesGranted())
     }
 
     /**

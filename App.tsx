@@ -5,87 +5,136 @@
  * PDFs and office documents. The only network traffic is fetching a model
  * file, and even that is optional — you can supply your own.
  *
+ * The shell here is a chat screen with a conversation drawer over it, and
+ * Models and Settings as full screens pushed on top. No navigation library:
+ * three destinations and a drawer do not need one, and every native
+ * dependency is one more thing that can break the CI build.
+ *
  * @format
  */
 
-import React, { useEffect, useState } from 'react';
-import { BackHandler, StatusBar, StyleSheet, View } from 'react-native';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  SafeAreaProvider,
-  initialWindowMetrics,
-} from 'react-native-safe-area-context';
+  Animated,
+  BackHandler,
+  PanResponder,
+  StatusBar,
+  StyleSheet,
+  View,
+} from 'react-native';
+import { SafeAreaProvider, initialWindowMetrics } from 'react-native-safe-area-context';
 import { LlamaProvider, useLlama } from './src/context/LlamaContext';
+import { ThemeProvider, useTheme } from './src/context/ThemeContext';
 import ChatScreen from './src/screens/ChatScreen';
 import ModelsScreen from './src/screens/ModelsScreen';
 import SettingsScreen from './src/screens/SettingsScreen';
-import NavBar, { TabKey } from './src/components/NavBar';
-import ErrorBoundary from './src/components/ErrorBoundary';
-import { installGlobalCrashLogging, logEvent } from './src/services/diagnostics';
-import { colors, useLayout } from './src/theme';
+import Drawer, { DrawerDestination } from './src/components/Drawer';
+import { useLayout } from './src/theme';
 
-installGlobalCrashLogging();
-
-function Root() {
-  const [tab, setTab] = useState<TabKey>('chat');
-  const { loadState } = useLlama();
+function Shell() {
+  const {
+    conversations,
+    activeConversation,
+    activeModel,
+    newChat,
+    selectChat,
+    renameChat,
+    deleteChat,
+    deleteAllChats,
+  } = useLlama();
+  const { colors, dark } = useTheme();
   const layout = useLayout();
 
-  const ready = loadState.status === 'ready';
+  const [screen, setScreen] = useState<DrawerDestination>('chat');
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const drawerProgress = useRef(new Animated.Value(0)).current;
 
-  // The hardware back button has no JS handler by default on the root
-  // screen, which leaves Android free to finish() the Activity rather than
-  // just backgrounding it — and finishing it tears down the native llama
-  // context along with everything else, so the loaded model is gone next
-  // time the app opens. Handling it explicitly keeps that from being a
-  // matter of chance: from a sub-tab it returns to Chat, and only backs
-  // out of the app (backgrounding it, never destroying it) from there.
+  const openDrawer = useCallback(() => setDrawerOpen(true), []);
+  const closeDrawer = useCallback(() => setDrawerOpen(false), []);
+
+  // Android's back button: close the drawer, then leave a sub-screen, then
+  // let the system take it. The drawer registers its own handler first.
   useEffect(() => {
+    if (screen === 'chat') return;
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
-      if (tab !== 'chat') {
-        setTab('chat');
-        return true;
-      }
-      logEvent('back_button_exit');
-      BackHandler.exitApp();
+      setScreen('chat');
       return true;
     });
     return () => sub.remove();
-  }, [tab]);
+  }, [screen]);
 
-  const screen =
-    tab === 'chat' ? (
-      <ChatScreen onGoToModels={() => setTab('models')} />
-    ) : tab === 'models' ? (
-      <ModelsScreen onLoaded={() => setTab('chat')} />
-    ) : (
-      <SettingsScreen />
-    );
+  /**
+   * Edge swipe to open the drawer.
+   *
+   * Only the left ~22dp responds, and only to a clearly horizontal drag, so
+   * it never competes with scrolling the conversation.
+   */
+  const pan = useRef(
+    PanResponder.create({
+      onMoveShouldSetPanResponder: (_e, g) =>
+        Math.abs(g.dx) > 8 && Math.abs(g.dx) > Math.abs(g.dy) * 1.6,
+      onPanResponderMove: (_e, g) => {
+        const fraction = Math.max(0, Math.min(1, g.dx / layout.drawerWidth));
+        drawerProgress.setValue(fraction);
+      },
+      onPanResponderRelease: (_e, g) => {
+        const opened = g.dx > layout.drawerWidth * 0.4 || g.vx > 0.5;
+        setDrawerOpen(opened);
+        Animated.timing(drawerProgress, {
+          toValue: opened ? 1 : 0,
+          duration: 160,
+          useNativeDriver: true,
+        }).start();
+      },
+    }),
+  ).current;
 
   return (
-    <View style={styles.root}>
-      {/* The app draws its own background all the way to the edges, and
-          each screen pads itself by the real insets rather than assuming a
-          fixed status-bar height. */}
-      <StatusBar barStyle="light-content" />
+    <View style={[styles.root, { backgroundColor: colors.background }]}>
+      {/* The bar colour itself is set natively (DocKit.setSystemBars), since
+          RN 0.87 draws edge-to-edge and no longer takes a backgroundColor. */}
+      <StatusBar barStyle={dark ? 'light-content' : 'dark-content'} />
 
-      {/* On a wide screen the chat stays open beside whatever else you're
-          doing, so changing a setting doesn't hide the conversation. */}
-      {layout.expanded && tab !== 'chat' ? (
-        <View style={styles.split}>
-          <View style={styles.splitMain}>{screen}</View>
-          <View style={styles.splitAside}>
-            <ChatScreen onGoToModels={() => setTab('models')} />
-          </View>
-        </View>
-      ) : (
-        <View style={styles.flex}>{screen}</View>
+      <View style={styles.flex}>
+        {screen === 'chat' && (
+          <ChatScreen
+            onOpenDrawer={openDrawer}
+            onOpenModels={() => setScreen('models')}
+          />
+        )}
+        {screen === 'models' && (
+          <ModelsScreen
+            onBack={() => setScreen('chat')}
+            onLoaded={() => setScreen('chat')}
+          />
+        )}
+        {screen === 'settings' && <SettingsScreen onBack={() => setScreen('chat')} />}
+      </View>
+
+      {/* The grab strip sits above the screen but below the drawer. */}
+      {screen === 'chat' && !drawerOpen && (
+        <View style={styles.edge} {...pan.panHandlers} />
       )}
 
-      <NavBar
-        active={tab}
-        onChange={setTab}
-        ready={ready}
-        horizontal={layout.landscape || !layout.compact}
+      <Drawer
+        open={drawerOpen}
+        progress={drawerProgress}
+        conversations={conversations}
+        activeId={activeConversation?.id}
+        modelLabel={activeModel?.label}
+        onClose={closeDrawer}
+        onSelect={id => {
+          selectChat(id);
+          setScreen('chat');
+        }}
+        onNewChat={() => {
+          newChat();
+          setScreen('chat');
+        }}
+        onRename={renameChat}
+        onDelete={deleteChat}
+        onDeleteAll={deleteAllChats}
+        onNavigate={setScreen}
       />
     </View>
   );
@@ -93,24 +142,25 @@ function Root() {
 
 export default function App() {
   return (
-    <ErrorBoundary>
-      <SafeAreaProvider initialMetrics={initialWindowMetrics}>
+    <SafeAreaProvider initialMetrics={initialWindowMetrics}>
+      <ThemeProvider>
         <LlamaProvider>
-          <Root />
+          <Shell />
         </LlamaProvider>
-      </SafeAreaProvider>
-    </ErrorBoundary>
+      </ThemeProvider>
+    </SafeAreaProvider>
   );
 }
 
 const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.background },
+  root: { flex: 1 },
   flex: { flex: 1 },
-  split: { flex: 1, flexDirection: 'row' },
-  splitMain: { flex: 1.1 },
-  splitAside: {
-    flex: 1,
-    borderLeftWidth: 1,
-    borderLeftColor: colors.borderSoft,
+  edge: {
+    position: 'absolute',
+    left: 0,
+    top: 0,
+    bottom: 0,
+    width: 22,
+    zIndex: 10,
   },
 });

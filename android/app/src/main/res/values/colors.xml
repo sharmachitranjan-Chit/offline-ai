@@ -1,0 +1,4 @@
+<resources>
+    <!-- Matches lightPalette.background in src/theme.ts. -->
+    <color name="app_background">#FBFAF9</color>
+</resources>

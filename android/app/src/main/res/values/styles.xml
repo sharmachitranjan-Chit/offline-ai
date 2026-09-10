@@ -1,9 +1,15 @@
 <resources>
 
-    <!-- Base application theme. -->
+    <!-- Base application theme.
+         DayNight means the window background follows the system setting, so
+         the frame Android draws before React Native mounts already matches
+         the theme the app is about to render. Without this, launching in
+         light mode flashes black. -->
     <style name="AppTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
-        <!-- Customize your theme here. -->
         <item name="android:editTextBackground">@drawable/rn_edit_text_material</item>
+        <item name="android:windowBackground">@color/app_background</item>
+        <item name="android:navigationBarColor">@color/app_background</item>
+        <item name="android:statusBarColor">@color/app_background</item>
     </style>
 
 </resources>

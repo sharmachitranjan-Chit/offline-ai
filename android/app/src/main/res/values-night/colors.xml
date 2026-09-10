@@ -1,0 +1,4 @@
+<resources>
+    <!-- Matches darkPalette.background in src/theme.ts. -->
+    <color name="app_background">#0B0D11</color>
+</resources>

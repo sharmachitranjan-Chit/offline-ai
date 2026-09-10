@@ -9,30 +9,24 @@ import React, {
 } from 'react';
 import * as RNFS from '@dr.pogodin/react-native-fs';
 import { initLlama, LlamaContext as LlamaCppContext } from 'llama.rn';
-import { InstalledModel, readRegistry } from '../services/modelManager';
+import {
+  InstalledModel,
+  readRegistry,
+  syncWithFolder,
+} from '../services/modelManager';
 import { Attachment, planAttachments } from '../services/attachments';
+import {
+  ChatMessage,
+  Conversation,
+  deriveTitle,
+  emptyConversation,
+  loadConversations,
+  newId,
+  saveConversations,
+} from '../services/conversations';
 import { DocKit } from '../native/DocKit';
-import { logEvent } from '../services/diagnostics';
 
-export type ChatRole = 'system' | 'user' | 'assistant';
-
-export type ChatMessage = {
-  id: string;
-  role: ChatRole;
-  content: string;
-  attachments?: Attachment[];
-  /** Content the model emitted inside reasoning tags, kept out of the reply. */
-  reasoning?: string;
-  error?: boolean;
-  /** Tokens per second for the completed turn. */
-  tps?: number;
-  /**
-   * Set when generation stopped because it hit the reply-length limit or
-   * ran out of context, rather than because the model actually finished.
-   * The content is real, just cut off mid-thought.
-   */
-  truncated?: boolean;
-};
+export type { ChatMessage, ChatRole } from '../services/conversations';
 
 export type LoadState =
   | { status: 'idle' }
@@ -52,6 +46,12 @@ export type Settings = {
   immersive: boolean;
   keepScreenOn: boolean;
   showReasoning: boolean;
+  /** Load the model you used last as soon as the app opens. */
+  autoLoadLastModel: boolean;
+  /** Tokens per second under each reply. */
+  showStats: boolean;
+  /** Remembered between launches so auto-load knows what to open. */
+  lastModelId?: string;
 };
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -59,98 +59,56 @@ export const DEFAULT_SETTINGS: Settings = {
     'You are a capable assistant running entirely on this device. Answer directly and completely. When the user attaches an image or a document, examine it carefully and ground your answer in what is actually there.',
   temperature: 0.7,
   topP: 0.9,
-  // 1024 sounds generous until you ask for a full C++ or Python file —
-  // that's routinely 1500-3000+ tokens, so the old default cut real
-  // answers off mid-function. 2048 is a better balance of "long code still
-  // fits" against "reply time on a phone stays reasonable"; the stepper in
-  // Settings still lets it go higher for anyone who wants that trade-off.
-  maxTokens: 2048,
+  maxTokens: 1024,
   threads: 4,
   contextSize: 8192,
   imageMaxTokens: 512,
   immersive: false,
   keepScreenOn: true,
   showReasoning: false,
+  autoLoadLastModel: true,
+  showStats: true,
 };
 
 const SETTINGS_PATH = `${RNFS.DocumentDirectoryPath}/settings.json`;
-const CHAT_PATH = `${RNFS.DocumentDirectoryPath}/conversation.json`;
-const LAST_MODEL_PATH = `${RNFS.DocumentDirectoryPath}/last_model.json`;
-const ARCHIVE_DIR = `${RNFS.DocumentDirectoryPath}/conversations`;
-
-/** How long the vision projector gets to initialize before we give up on
- * it rather than let a hang leave the whole app stuck on the loading
- * screen (which is what "the composer never opens for image models" turns
- * out to be — vision init that never resolves). */
-const MULTIMODAL_INIT_TIMEOUT_MS = 45_000;
-
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${label} timed out`)), ms);
-    promise.then(
-      v => {
-        clearTimeout(timer);
-        resolve(v);
-      },
-      e => {
-        clearTimeout(timer);
-        reject(e);
-      },
-    );
-  });
-}
-
-/**
- * Picks generation settings from what the phone actually reports, rather
- * than one fixed default for every device. The two levers that matter
- * most for a tight-memory phone are context size (it drives the KV cache,
- * which is real non-swappable RAM) and thread count (more isn't faster
- * once you're past the efficiency cores) — both scale down automatically
- * as available memory and core count drop.
- */
-function recommendedSettings(device: {
-  totalRamBytes: number;
-  availRamBytes: number;
-  cores: number;
-}): Partial<Settings> {
-  const availGiB = device.availRamBytes / 1024 ** 3;
-  const contextSize = availGiB < 2 ? 2048 : availGiB < 3.5 ? 4096 : availGiB < 6 ? 6144 : 8192;
-  const maxTokens = availGiB < 2 ? 1024 : availGiB < 3.5 ? 1536 : 2048;
-  const threads = Math.max(2, Math.min(6, Math.round(device.cores / 2)));
-  const imageMaxTokens = availGiB < 3 ? 256 : 512;
-  return { contextSize, maxTokens, threads, imageMaxTokens };
-}
 
 type LlamaContextValue = {
   loadState: LoadState;
   activeModel: InstalledModel | undefined;
   installed: InstalledModel[];
-  refreshInstalled: () => Promise<void>;
+  refreshInstalled: () => Promise<InstalledModel[]>;
   visionEnabled: boolean;
   isGenerating: boolean;
+
+  conversations: Conversation[];
+  activeConversation: Conversation | undefined;
   messages: ChatMessage[];
+  newChat: () => void;
+  selectChat: (id: string) => void;
+  renameChat: (id: string, title: string) => void;
+  deleteChat: (id: string) => void;
+  deleteAllChats: () => void;
+
   settings: Settings;
   updateSettings: (patch: Partial<Settings>) => void;
-  resetSettings: () => void;
-  tuneForDevice: () => Promise<boolean>;
   loadModel: (installed: InstalledModel) => Promise<void>;
   unloadModel: () => Promise<void>;
   sendMessage: (text: string, attachments?: Attachment[]) => Promise<void>;
+  /** Replaces a user turn and re-runs everything after it. */
+  editMessage: (id: string, text: string) => Promise<void>;
   regenerate: () => Promise<void>;
-  continueReply: (messageId: string) => Promise<void>;
   stopGenerating: () => void;
-  resetChat: () => void;
 };
 
 const Ctx = createContext<LlamaContextValue | null>(null);
 
-let idCounter = 0;
-const nextId = () => `msg_${++idCounter}_${Date.now()}`;
+/** A stable empty array, so "no conversation" doesn't rerender everything. */
+const EMPTY_MESSAGES: ChatMessage[] = [];
 
 /**
- * Reasoning models emit their scratchpad inside tags. Showing that raw in
- * the bubble is noisy and confusing, so it gets split off and surfaced
- * separately (or hidden entirely, per settings).
+ * Reasoning models emit their scratchpad inside tags. Showing that raw in the
+ * bubble is noisy and confusing, so it gets split off and surfaced separately
+ * (or hidden entirely, per settings).
  */
 const REASONING_TAGS = ['think', 'thinking', 'reasoning', 'thought'];
 
@@ -176,76 +134,76 @@ function splitReasoning(raw: string): { visible: string; reasoning: string } {
 
 export function LlamaProvider({ children }: { children: React.ReactNode }) {
   const [loadState, setLoadState] = useState<LoadState>({ status: 'idle' });
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [installed, setInstalled] = useState<InstalledModel[]>([]);
   const [activeModel, setActiveModel] = useState<InstalledModel | undefined>();
   const [visionEnabled, setVisionEnabled] = useState(false);
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
 
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [activeId, setActiveId] = useState<string | undefined>();
+
   const contextRef = useRef<LlamaCppContext | null>(null);
   const stopRequested = useRef(false);
-  const messagesRef = useRef<ChatMessage[]>([]);
-  messagesRef.current = messages;
-  const pendingAutoLoad = useRef<InstalledModel | null>(null);
+  const conversationsRef = useRef<Conversation[]>([]);
+  conversationsRef.current = conversations;
+  const activeIdRef = useRef<string | undefined>(undefined);
+  activeIdRef.current = activeId;
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+
+  const activeConversation = useMemo(
+    () => conversations.find(c => c.id === activeId),
+    [conversations, activeId],
+  );
+  const messages = useMemo(
+    () => activeConversation?.messages ?? EMPTY_MESSAGES,
+    [activeConversation],
+  );
 
   // ---- persistence -------------------------------------------------
 
   useEffect(() => {
+    let cancelled = false;
     (async () => {
-      let hadSavedSettings = false;
+      let loaded = DEFAULT_SETTINGS;
       try {
         if (await RNFS.exists(SETTINGS_PATH)) {
-          hadSavedSettings = true;
           const saved = JSON.parse(await RNFS.readFile(SETTINGS_PATH, 'utf8'));
-          setSettings({ ...DEFAULT_SETTINGS, ...saved });
+          loaded = { ...DEFAULT_SETTINGS, ...saved };
         }
       } catch {
         // Corrupt settings shouldn't stop the app from opening.
       }
-      try {
-        if (await RNFS.exists(CHAT_PATH)) {
-          const saved = JSON.parse(await RNFS.readFile(CHAT_PATH, 'utf8'));
-          if (Array.isArray(saved)) setMessages(saved);
-        }
-      } catch {
-        // Same.
-      }
-      const registry = await readRegistry();
-      setInstalled(registry);
+      if (cancelled) return;
+      setSettings(loaded);
 
-      // Restore whichever model was active last time, so closing and
-      // reopening the app (or the OS reclaiming the Activity) doesn't mean
-      // reselecting it by hand every single time.
-      try {
-        if (await RNFS.exists(LAST_MODEL_PATH)) {
-          const { modelId } = JSON.parse(
-            await RNFS.readFile(LAST_MODEL_PATH, 'utf8'),
-          );
-          const match = registry.find(m => m.id === modelId);
-          if (match) {
-            logEvent('auto_restore_model', { modelId });
-            // loadModelRef is assigned further down, once defined.
-            pendingAutoLoad.current = match;
-          }
-        }
-      } catch {
-        // No last-model record — fine, nothing to restore.
+      const chats = await loadConversations();
+      if (cancelled) return;
+      if (chats.length) {
+        setConversations(chats);
+        setActiveId(chats[0].id);
+      } else {
+        const fresh = emptyConversation();
+        setConversations([fresh]);
+        setActiveId(fresh.id);
       }
 
-      // First-ever launch: there's no saved settings file yet, so pick
-      // starting values from what this specific phone actually has,
-      // instead of one fixed default that's wrong for both a tight
-      // 8 GB phone and a spacious 16 GB one.
-      if (!hadSavedSettings) {
-        const device = await DocKit.getDeviceInfo();
-        if (device) {
-          const tuned = recommendedSettings(device);
-          setSettings(prev => ({ ...prev, ...tuned }));
-          logEvent('settings_auto_tuned_first_run', tuned);
-        }
+      // The models folder is the source of truth: anything dropped in by
+      // another app, a browser or a file manager shows up without an import.
+      const models = await syncWithFolder().catch(() => readRegistry());
+      if (cancelled) return;
+      setInstalled(models);
+
+      if (loaded.autoLoadLastModel && loaded.lastModelId) {
+        const last = models.find(m => m.id === loaded.lastModelId);
+        if (last) loadModelRef.current?.(last);
       }
     })();
+    return () => {
+      cancelled = true;
+    };
+    // Deliberately runs once: this is app start-up.
   }, []);
 
   useEffect(() => {
@@ -253,18 +211,17 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
     DocKit.setImmersive(settings.immersive);
   }, [settings]);
 
+  // Conversations are written on a short delay so a streaming reply doesn't
+  // rewrite the whole history file on every token.
   useEffect(() => {
-    const t = setTimeout(() => {
-      RNFS.writeFile(CHAT_PATH, JSON.stringify(messages.slice(-80)), 'utf8').catch(
-        () => {},
-      );
-    }, 600);
+    if (!conversations.length) return;
+    const t = setTimeout(() => saveConversations(conversations), 700);
     return () => clearTimeout(t);
-  }, [messages]);
+  }, [conversations]);
 
-  // Keeping the screen awake only while a reply is streaming, rather than
-  // for the whole session — a long generation shouldn't be interrupted,
-  // but neither should the phone sit lit up doing nothing.
+  // Keeping the screen awake only while a reply is streaming, rather than for
+  // the whole session — a long generation shouldn't be interrupted, but
+  // neither should the phone sit lit up doing nothing.
   useEffect(() => {
     DocKit.setKeepScreenOn(settings.keepScreenOn && isGenerating);
     return () => DocKit.setKeepScreenOn(false);
@@ -275,7 +232,62 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const refreshInstalled = useCallback(async () => {
-    setInstalled(await readRegistry());
+    const models = await syncWithFolder().catch(() => readRegistry());
+    setInstalled(models);
+    return models;
+  }, []);
+
+  // ---- conversation plumbing ---------------------------------------
+
+  const patchConversation = useCallback(
+    (id: string, patch: (c: Conversation) => Conversation) => {
+      setConversations(prev =>
+        prev.map(c => (c.id === id ? patch(c) : c)),
+      );
+    },
+    [],
+  );
+
+  const newChat = useCallback(() => {
+    // An untouched blank chat is reused rather than stacking up empties.
+    const existingBlank = conversationsRef.current.find(c => c.messages.length === 0);
+    if (existingBlank) {
+      setActiveId(existingBlank.id);
+      return;
+    }
+    const fresh = emptyConversation();
+    setConversations(prev => [fresh, ...prev]);
+    setActiveId(fresh.id);
+  }, []);
+
+  const selectChat = useCallback((id: string) => setActiveId(id), []);
+
+  const renameChat = useCallback(
+    (id: string, title: string) => {
+      const clean = title.trim();
+      if (!clean) return;
+      patchConversation(id, c => ({ ...c, title: clean }));
+    },
+    [patchConversation],
+  );
+
+  const deleteChat = useCallback((id: string) => {
+    setConversations(prev => {
+      const next = prev.filter(c => c.id !== id);
+      if (next.length === 0) {
+        const fresh = emptyConversation();
+        setActiveId(fresh.id);
+        return [fresh];
+      }
+      if (activeIdRef.current === id) setActiveId(next[0].id);
+      return next;
+    });
+  }, []);
+
+  const deleteAllChats = useCallback(() => {
+    const fresh = emptyConversation();
+    setConversations([fresh]);
+    setActiveId(fresh.id);
   }, []);
 
   // ---- model lifecycle ---------------------------------------------
@@ -296,17 +308,13 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
     await releaseContext();
     setActiveModel(undefined);
     setLoadState({ status: 'idle' });
-    // An explicit unload is a decision, not a crash — don't reload this
-    // model automatically next launch.
-    RNFS.unlink(LAST_MODEL_PATH).catch(() => {});
-    logEvent('model_unloaded');
   }, [releaseContext]);
 
   const loadModel = useCallback(
     async (model: InstalledModel) => {
-      // Only one model fits in phone memory, so the previous one always
-      // goes first. Note this runs even if the last load errored — an
-      // earlier failure must never leave the engine permanently parked.
+      // Only one model fits in phone memory, so the previous one always goes
+      // first. This runs even if the last load errored — an earlier failure
+      // must never leave the engine permanently parked.
       await releaseContext();
 
       setActiveModel(model);
@@ -316,38 +324,20 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
         progress: 0,
         stage: 'Reading weights',
       });
-      logEvent('model_load_start', { modelId: model.id, sizeBytes: model.sizeBytes });
 
       try {
         if (!(await RNFS.exists(model.path))) {
           throw new Error(
-            'The model file is no longer at its saved location. Re-import it from the Models tab.',
+            'The model file is no longer at its saved location. It may have been moved or deleted from the models folder.',
           );
         }
 
-        // Weights are mmap'd, so the model file does not need to be fully
-        // resident to load — the kernel pages it in from disk as needed
-        // and can reclaim clean pages under pressure. What actually costs
-        // real, non-swappable RAM is the KV cache (sized by the context
-        // window) plus a modest compute buffer — not the file size. An
-        // earlier version of this check compared the whole file against
-        // free RAM and ended up blocking every model on a tight-memory
-        // phone for no real reason. It's gone; if a load is genuinely
-        // going to fail, the native loader below will say so with a real
-        // error instead of a guess.
-        const device = await DocKit.getDeviceInfo();
-        if (device && device.availRamBytes > 0 && device.availRamBytes < 300 * 1024 * 1024) {
-          logEvent('load_attempt_low_memory', {
-            modelId: model.id,
-            availRamBytes: device.availRamBytes,
-          });
-        }
-
+        const s = settingsRef.current;
         const ctx = await initLlama(
           {
             model: model.path,
-            n_ctx: settings.contextSize || model.contextSize,
-            n_threads: settings.threads,
+            n_ctx: s.contextSize || model.contextSize,
+            n_threads: s.threads,
             n_gpu_layers: 0, // CPU only: GPU offload on Adreno is still a reliable way to overheat
             use_mlock: false,
             use_mmap: true,
@@ -372,40 +362,24 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
             stage: 'Starting vision encoder',
           });
           try {
-            // Wrapped in a timeout: a projector that hangs (rather than
-            // errors) used to leave the whole app parked on the loading
-            // screen forever — which looked, from the chat tab, exactly
-            // like "the composer never opens" for vision models.
-            await withTimeout(
-              ctx.initMultimodal({
-                path: model.mmprojPath,
-                use_gpu: false,
-                image_max_tokens: settings.imageMaxTokens,
-              }),
-              MULTIMODAL_INIT_TIMEOUT_MS,
-              'Vision encoder init',
-            );
+            await ctx.initMultimodal({
+              path: model.mmprojPath,
+              use_gpu: false,
+              image_max_tokens: s.imageMaxTokens,
+            });
             const support = await ctx.getMultimodalSupport();
             vision = !!support?.vision;
-          } catch (mmErr: any) {
-            // A bad or slow projector shouldn't cost you the text model too.
+          } catch {
+            // A bad projector shouldn't cost you the text model too.
             vision = false;
-            logEvent('multimodal_init_failed', {
-              modelId: model.id,
-              message: mmErr?.message,
-            });
           }
         }
 
         setVisionEnabled(vision);
         setLoadState({ status: 'ready', modelId: model.id, vision });
-        logEvent('model_load_ready', { modelId: model.id, vision });
-
-        RNFS.writeFile(
-          LAST_MODEL_PATH,
-          JSON.stringify({ modelId: model.id }),
-          'utf8',
-        ).catch(() => {});
+        setSettings(prev =>
+          prev.lastModelId === model.id ? prev : { ...prev, lastModelId: model.id },
+        );
       } catch (err: any) {
         await releaseContext();
         setLoadState({
@@ -413,22 +387,15 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
           modelId: model.id,
           message: err?.message ?? 'Failed to load this model.',
         });
-        logEvent('model_load_failed', { modelId: model.id, message: err?.message });
       }
     },
-    [releaseContext, settings.contextSize, settings.threads, settings.imageMaxTokens],
+    [releaseContext],
   );
 
-  // Fires once the registry has loaded and a previously-active model was
-  // found (see the persistence effect above). Deferred to its own effect
-  // so it always runs against the latest `loadModel` closure.
-  useEffect(() => {
-    if (pendingAutoLoad.current) {
-      const model = pendingAutoLoad.current;
-      pendingAutoLoad.current = null;
-      loadModel(model);
-    }
-  }, [installed, loadModel]);
+  // Start-up auto-load happens before `loadModel` is in scope, so it goes
+  // through a ref rather than being wired as an effect dependency.
+  const loadModelRef = useRef(loadModel);
+  loadModelRef.current = loadModel;
 
   // ---- generation ---------------------------------------------------
 
@@ -438,22 +405,17 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const runCompletion = useCallback(
-    async (
-      history: ChatMessage[],
-      assistantId: string,
-      opts: { extraInstruction?: string; seed?: string } = {},
-    ) => {
+    async (conversationId: string, history: ChatMessage[], assistantId: string) => {
       const ctx = contextRef.current;
       if (!ctx) return;
 
       setIsGenerating(true);
       stopRequested.current = false;
       const startedAt = Date.now();
+      const s = settingsRef.current;
 
       try {
-        const apiMessages: any[] = [
-          { role: 'system', content: settings.systemPrompt },
-        ];
+        const apiMessages: any[] = [{ role: 'system', content: s.systemPrompt }];
 
         for (const m of history) {
           if (m.role === 'assistant') {
@@ -480,214 +442,199 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
           apiMessages.push({ role: m.role, content: parts });
         }
 
-        if (opts.extraInstruction) {
-          apiMessages.push({ role: 'user', content: opts.extraInstruction });
-        }
-
-        let accumulated = opts.seed ?? '';
+        let accumulated = '';
         let tokenCount = 0;
+        let lastPaint = 0;
 
-        const result = await ctx.completion(
+        const paint = (force = false) => {
+          const now = Date.now();
+          // Repainting on every token means a state update and a re-render
+          // per token; at 20 tok/s that is wasted work the phone pays for in
+          // heat. Painting on a ~16 fps cadence looks identical.
+          if (!force && now - lastPaint < 60) return;
+          lastPaint = now;
+          const { visible, reasoning } = splitReasoning(accumulated);
+          setConversations(prev =>
+            prev.map(c =>
+              c.id !== conversationId
+                ? c
+                : {
+                    ...c,
+                    messages: c.messages.map(m =>
+                      m.id === assistantId ? { ...m, content: visible, reasoning } : m,
+                    ),
+                  },
+            ),
+          );
+        };
+
+        await ctx.completion(
           {
             messages: apiMessages,
-            n_predict: settings.maxTokens,
-            temperature: settings.temperature,
-            top_p: settings.topP,
+            n_predict: s.maxTokens,
+            temperature: s.temperature,
+            top_p: s.topP,
           },
           data => {
             if (stopRequested.current) return;
             accumulated += data.token;
             tokenCount++;
-            const { visible, reasoning } = splitReasoning(accumulated);
-            setMessages(prev =>
-              prev.map(m =>
-                m.id === assistantId
-                  ? { ...m, content: visible, reasoning, truncated: false }
-                  : m,
-              ),
-            );
+            paint();
           },
         );
 
         const seconds = (Date.now() - startedAt) / 1000;
         const tps = seconds > 0 ? tokenCount / seconds : undefined;
-        // The reply is genuinely cut off (not just done) when it stopped
-        // because it ran into the length cap or the context window, rather
-        // than because the model reached a natural end. Surfacing that
-        // beats a big C++ file that just silently stops mid-function.
-        const truncated =
-          !stopRequested.current &&
-          !result?.interrupted &&
-          !result?.stopped_eos &&
-          !result?.stopped_word &&
-          (!!result?.stopped_limit || !!result?.context_full);
-        setMessages(prev =>
-          prev.map(m => (m.id === assistantId ? { ...m, tps, truncated } : m)),
+        paint(true);
+        setConversations(prev =>
+          prev.map(c =>
+            c.id !== conversationId
+              ? c
+              : {
+                  ...c,
+                  updatedAt: Date.now(),
+                  messages: c.messages.map(m =>
+                    m.id === assistantId ? { ...m, tps } : m,
+                  ),
+                },
+          ),
         );
-        if (truncated) {
-          logEvent('reply_truncated', {
-            maxTokens: settings.maxTokens,
-            contextFull: !!result?.context_full,
-          });
-        }
       } catch (err: any) {
-        logEvent('generation_error', { message: err?.message });
-        setMessages(prev =>
-          prev.map(m =>
-            m.id === assistantId
-              ? {
-                  ...m,
-                  error: !m.content,
-                  content:
-                    m.content ||
-                    `Generation failed: ${err?.message ?? 'unknown error'}`,
-                }
-              : m,
+        setConversations(prev =>
+          prev.map(c =>
+            c.id !== conversationId
+              ? c
+              : {
+                  ...c,
+                  messages: c.messages.map(m =>
+                    m.id === assistantId
+                      ? {
+                          ...m,
+                          error: !m.content,
+                          content:
+                            m.content ||
+                            `Generation failed: ${err?.message ?? 'unknown error'}`,
+                        }
+                      : m,
+                  ),
+                },
           ),
         );
       } finally {
         setIsGenerating(false);
       }
     },
-    [settings, visionEnabled],
+    [visionEnabled],
+  );
+
+  const startTurn = useCallback(
+    async (conversationId: string, history: ChatMessage[], notices: string[]) => {
+      const assistantId = newId('msg');
+      const extra: ChatMessage[] = notices.map(text => ({
+        id: newId('msg'),
+        role: 'assistant',
+        content: text,
+        error: true,
+        createdAt: Date.now(),
+      }));
+
+      setConversations(prev =>
+        prev.map(c =>
+          c.id !== conversationId
+            ? c
+            : {
+                ...c,
+                title:
+                  c.title === 'New chat'
+                    ? deriveTitle(history) ?? c.title
+                    : c.title,
+                modelLabel: activeModel?.label ?? c.modelLabel,
+                updatedAt: Date.now(),
+                messages: [
+                  ...history,
+                  ...extra,
+                  {
+                    id: assistantId,
+                    role: 'assistant',
+                    content: '',
+                    createdAt: Date.now(),
+                  },
+                ],
+              },
+        ),
+      );
+
+      await runCompletion(conversationId, history, assistantId);
+    },
+    [runCompletion, activeModel],
   );
 
   const sendMessage = useCallback(
     async (text: string, attachments: Attachment[] = []) => {
+      const conversationId = activeIdRef.current;
+      if (!conversationId) return;
       if (loadState.status !== 'ready' || !contextRef.current) return;
       const trimmed = text.trim();
       if (!trimmed && attachments.length === 0) return;
 
       const { skipped } = planAttachments(attachments, visionEnabled);
+      const current =
+        conversationsRef.current.find(c => c.id === conversationId)?.messages ?? [];
 
       const userMsg: ChatMessage = {
-        id: nextId(),
+        id: newId('msg'),
         role: 'user',
         content: trimmed,
         attachments: attachments.length ? attachments : undefined,
-      };
-      const assistantId = nextId();
-      const assistantMsg: ChatMessage = {
-        id: assistantId,
-        role: 'assistant',
-        content: '',
+        createdAt: Date.now(),
       };
 
-      const history = [...messagesRef.current, userMsg];
-      setMessages([...history, assistantMsg]);
-
-      if (skipped.length) {
+      await startTurn(
+        conversationId,
+        [...current, userMsg],
         // Say so rather than quietly ignoring an attachment.
-        setMessages(prev => [
-          ...prev.slice(0, -1),
-          {
-            id: nextId(),
-            role: 'assistant',
-            content: `Couldn't include:\n${skipped.map(s => `• ${s}`).join('\n')}`,
-            error: true,
-          },
-          prev[prev.length - 1],
-        ]);
-      }
-
-      await runCompletion(history, assistantId);
+        skipped.length
+          ? [`Couldn't include:\n${skipped.map(s => `• ${s}`).join('\n')}`]
+          : [],
+      );
     },
-    [loadState, runCompletion, visionEnabled],
+    [loadState, visionEnabled, startTurn],
+  );
+
+  const editMessage = useCallback(
+    async (id: string, text: string) => {
+      const conversationId = activeIdRef.current;
+      if (!conversationId || loadState.status !== 'ready' || isGenerating) return;
+      const conv = conversationsRef.current.find(c => c.id === conversationId);
+      if (!conv) return;
+      const index = conv.messages.findIndex(m => m.id === id);
+      if (index < 0) return;
+
+      const history = [
+        ...conv.messages.slice(0, index),
+        { ...conv.messages[index], content: text.trim(), tps: undefined },
+      ];
+      await startTurn(conversationId, history, []);
+    },
+    [loadState, isGenerating, startTurn],
   );
 
   const regenerate = useCallback(async () => {
-    if (loadState.status !== 'ready' || isGenerating) return;
-    const msgs = messagesRef.current;
+    const conversationId = activeIdRef.current;
+    if (!conversationId || loadState.status !== 'ready' || isGenerating) return;
+    const conv = conversationsRef.current.find(c => c.id === conversationId);
+    if (!conv) return;
+
     let lastUser = -1;
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      if (msgs[i].role === 'user') {
+    for (let i = conv.messages.length - 1; i >= 0; i--) {
+      if (conv.messages[i].role === 'user') {
         lastUser = i;
         break;
       }
     }
     if (lastUser < 0) return;
-
-    const history = msgs.slice(0, lastUser + 1);
-    const assistantId = nextId();
-    setMessages([...history, { id: assistantId, role: 'assistant', content: '' }]);
-    await runCompletion(history, assistantId);
-  }, [loadState, isGenerating, runCompletion]);
-
-  const continueReply = useCallback(
-    async (messageId: string) => {
-      if (loadState.status !== 'ready' || isGenerating) return;
-      const msgs = messagesRef.current;
-      const idx = msgs.findIndex(m => m.id === messageId);
-      if (idx < 0) return;
-      const target = msgs[idx];
-      if (target.role !== 'assistant') return;
-
-      // Continuing reuses the same bubble rather than opening a new one:
-      // the truncated assistant turn is sent as context, a hidden
-      // instruction asks the model to pick up exactly where it left off,
-      // and new tokens are appended onto the existing content in place —
-      // so a cut-off answer stays one continuous reply instead of
-      // fragmenting across separate chat turns.
-      const history = msgs.slice(0, idx + 1);
-      await runCompletion(history, messageId, {
-        extraInstruction:
-          'Continue your previous reply exactly from where it stopped. Do not repeat anything you already said and do not restart from the beginning.',
-        seed: target.content,
-      });
-    },
-    [loadState, isGenerating, runCompletion],
-  );
-
-  const resetChat = useCallback(() => {
-    const outgoing = messagesRef.current;
-    setMessages([]);
-
-    // Overwrite immediately rather than waiting for the debounced autosave
-    // — otherwise a crash in the next second or two brings the "cleared"
-    // conversation right back on relaunch.
-    RNFS.writeFile(CHAT_PATH, JSON.stringify([]), 'utf8').catch(() => {});
-
-    // Archive what was there rather than just discarding it, so "start a
-    // new chat" doesn't mean the previous conversation is gone for good.
-    if (outgoing.length > 0) {
-      RNFS.mkdir(ARCHIVE_DIR)
-        .catch(() => {})
-        .finally(() => {
-          RNFS.writeFile(
-            `${ARCHIVE_DIR}/session-${Date.now()}.json`,
-            JSON.stringify(outgoing),
-            'utf8',
-          ).catch(() => {});
-        });
-    }
-
-    // Actually clear the model's own KV cache — a `?.()` that silently
-    // swallows its result meant a failed clear left old turns bleeding
-    // into the "new" conversation with no sign anything had gone wrong.
-    contextRef.current
-      ?.clearCache?.(true)
-      ?.then(() => logEvent('chat_reset'))
-      ?.catch((err: any) =>
-        logEvent('chat_reset_cache_clear_failed', { message: err?.message }),
-      );
-  }, []);
-
-  const resetSettings = useCallback(() => {
-    setSettings(DEFAULT_SETTINGS);
-    logEvent('settings_reset');
-  }, []);
-
-  /** Same tuning logic as first-run, but callable on demand — e.g. after
-   * closing other apps and freeing up memory, or just to get back to a
-   * sane baseline. Returns false if device info wasn't available. */
-  const tuneForDevice = useCallback(async (): Promise<boolean> => {
-    const device = await DocKit.getDeviceInfo();
-    if (!device) return false;
-    const tuned = recommendedSettings(device);
-    setSettings(prev => ({ ...prev, ...tuned }));
-    logEvent('settings_tuned_manual', tuned);
-    return true;
-  }, []);
+    await startTurn(conversationId, conv.messages.slice(0, lastUser + 1), []);
+  }, [loadState, isGenerating, startTurn]);
 
   const value = useMemo<LlamaContextValue>(
     () => ({
@@ -697,18 +644,22 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
       refreshInstalled,
       visionEnabled,
       isGenerating,
+      conversations,
+      activeConversation,
       messages,
+      newChat,
+      selectChat,
+      renameChat,
+      deleteChat,
+      deleteAllChats,
       settings,
       updateSettings,
-      resetSettings,
-      tuneForDevice,
       loadModel,
       unloadModel,
       sendMessage,
+      editMessage,
       regenerate,
-      continueReply,
       stopGenerating,
-      resetChat,
     }),
     [
       loadState,
@@ -717,18 +668,22 @@ export function LlamaProvider({ children }: { children: React.ReactNode }) {
       refreshInstalled,
       visionEnabled,
       isGenerating,
+      conversations,
+      activeConversation,
       messages,
+      newChat,
+      selectChat,
+      renameChat,
+      deleteChat,
+      deleteAllChats,
       settings,
       updateSettings,
-      resetSettings,
-      tuneForDevice,
       loadModel,
       unloadModel,
       sendMessage,
+      editMessage,
       regenerate,
-      continueReply,
       stopGenerating,
-      resetChat,
     ],
   );
 

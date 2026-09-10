@@ -1,33 +1,33 @@
-import React, { useState } from 'react';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import React, { useMemo, useState } from 'react';
+import { Pressable, Text, View } from 'react-native';
+import Icon from './Icon';
+import ProgressBar from './ProgressBar';
+import Sheet, { SheetRow, SheetSection } from './Sheet';
 import {
   ModelEntry,
   TAG_LABELS,
-  getMmprojDownloadUrl,
-  getModelDownloadUrl,
+  downloadUrl,
   getRepoPageUrl,
-  totalSizeGiB,
+  projectorById,
+  quantById,
+  totalBytes,
 } from '../data/modelCatalog';
 import { DownloadStatus, formatBytes } from '../services/modelManager';
 import { DocKit } from '../native/DocKit';
-import ProgressBar from './ProgressBar';
-import { colors, fontSizes, radius, spacing } from '../theme';
+import { makeStyles, useColors } from '../context/ThemeContext';
+import { fontSizes, radius, spacing } from '../theme';
 
-type Props = {
-  model: ModelEntry;
-  installed: boolean;
-  active: boolean;
-  /** Live status per file, when a transfer is running. */
-  status?: { model?: DownloadStatus; mmproj?: DownloadStatus };
-  /** Device RAM in GiB, used to flag models that won't fit. */
-  deviceRamGiB?: number;
-  onDownload: () => void;
-  onPause: () => void;
-  onCancel: () => void;
-  onLoad: () => void;
-  onDelete: () => void;
-};
+export type ModelChoice = { quantId?: string; projectorId?: string };
 
+/**
+ * One catalog entry.
+ *
+ * Three things this card insists on showing, because each of them is a
+ * question people actually have before committing to a multi-gigabyte
+ * download: what it will cost in storage, whether this phone has the memory
+ * to run it, and where the file comes from — the direct link is always one
+ * tap away, so nobody is forced through the in-app downloader.
+ */
 export default function ModelListItem({
   model,
   installed,
@@ -39,294 +39,336 @@ export default function ModelListItem({
   onCancel,
   onLoad,
   onDelete,
-}: Props) {
-  const [showLinks, setShowLinks] = useState(false);
+  onNotify,
+}: {
+  model: ModelEntry;
+  installed: boolean;
+  active: boolean;
+  status: { model?: DownloadStatus; mmproj?: DownloadStatus };
+  deviceRamGiB?: number;
+  onDownload: (choice: ModelChoice) => void;
+  onPause: () => void;
+  onCancel: () => void;
+  onLoad: () => void;
+  onDelete: () => void;
+  onNotify: (message: string) => void;
+}) {
+  const c = useColors();
+  const styles = useStyles();
+  const [optionsOpen, setOptionsOpen] = useState(false);
+  const [linksOpen, setLinksOpen] = useState(false);
+  const [quantId, setQuantId] = useState(model.quants[0].id);
+  const [projectorId, setProjectorId] = useState(model.mmproj?.[0]?.id);
 
-  const running = status?.model?.state === 'running' || status?.mmproj?.state === 'running';
-  const paused = status?.model?.state === 'paused' || status?.mmproj?.state === 'paused';
-  const failed = status?.model?.state === 'error' || status?.mmproj?.state === 'error';
-  const errorMessage = status?.model?.message ?? status?.mmproj?.message;
+  const quant = quantById(model, quantId);
+  const projector = projectorById(model, projectorId);
+  const size = totalBytes(model, quantId, projectorId);
 
-  const live = status?.mmproj?.state === 'running' ? status.mmproj : status?.model;
+  const live = status.mmproj ?? status.model;
+  const running = live?.state === 'running';
+  const paused = live?.state === 'paused';
+  const failed = live?.state === 'error';
   const fraction = live && live.total > 0 ? live.written / live.total : -1;
 
-  const tooBig = deviceRamGiB !== undefined && model.minRamGiB > deviceRamGiB;
+  const tooBig = deviceRamGiB !== undefined && deviceRamGiB + 0.4 < model.minRamGiB;
+  const tight =
+    !tooBig && deviceRamGiB !== undefined && deviceRamGiB < model.minRamGiB + 1.5;
 
-  const modelUrl = getModelDownloadUrl(model);
-  const mmprojUrl = getMmprojDownloadUrl(model);
+  const tags = useMemo(
+    () => model.tags.filter(t => t !== 'recommended'),
+    [model.tags],
+  );
+
+  const copy = (label: string, url: string) => {
+    DocKit.setClipboard(url);
+    onNotify(`${label} link copied.`);
+  };
 
   return (
     <View style={[styles.card, active && styles.cardActive]}>
-      <View style={styles.headerRow}>
-        <View style={styles.titleBox}>
-          <Text style={styles.title}>{model.label}</Text>
-          <Text style={styles.sub}>
-            {model.publisher} · {model.paramCount} · {model.quant} ·{' '}
-            {totalSizeGiB(model).toFixed(1)} GB
+      <View style={styles.head}>
+        <View style={styles.headText}>
+          <View style={styles.titleRow}>
+            <Text style={styles.title} numberOfLines={1}>
+              {model.label}
+            </Text>
+            {model.tags.includes('recommended') && (
+              <View style={styles.star}>
+                <Text style={styles.starText}>Recommended</Text>
+              </View>
+            )}
+          </View>
+          <Text style={styles.meta} numberOfLines={1}>
+            {model.publisher} · {model.paramCount} · {formatBytes(size)}
+            {model.mmproj ? ' incl. projector' : ''}
           </Text>
         </View>
-        {active && (
-          <View style={styles.activePill}>
-            <Text style={styles.activePillText}>Loaded</Text>
+        {installed && (
+          <View style={styles.installedPill}>
+            <Icon name="check" size={11} color={c.success} />
+            <Text style={styles.installedText}>Installed</Text>
           </View>
         )}
       </View>
 
-      {!!model.tags.length && (
+      <Text style={styles.description}>{model.description}</Text>
+
+      {(tags.length > 0 || tooBig || tight) && (
         <View style={styles.tags}>
-          {model.tags.map(t => (
-            <View
-              key={t}
-              style={[
-                styles.tag,
-                t === 'recommended' && styles.tagAccent,
-                t === 'uncensored' && styles.tagWarn,
-                t === 'vision' && styles.tagSuccess,
-              ]}>
-              <Text
-                style={[
-                  styles.tagText,
-                  t === 'recommended' && styles.tagTextAccent,
-                  t === 'uncensored' && styles.tagTextWarn,
-                  t === 'vision' && styles.tagTextSuccess,
-                ]}>
-                {TAG_LABELS[t]}
-              </Text>
+          {tags.map(t => (
+            <View key={t} style={styles.tag}>
+              <Text style={styles.tagText}>{TAG_LABELS[t]}</Text>
             </View>
           ))}
+          {tooBig && (
+            <View style={[styles.tag, styles.tagDanger]}>
+              <Text style={[styles.tagText, styles.tagDangerText]}>
+                Needs ~{model.minRamGiB} GB RAM
+              </Text>
+            </View>
+          )}
+          {tight && (
+            <View style={[styles.tag, styles.tagWarn]}>
+              <Text style={[styles.tagText, styles.tagWarnText]}>
+                Tight on this phone
+              </Text>
+            </View>
+          )}
         </View>
       )}
 
-      <Text style={styles.description}>{model.description}</Text>
-
-      {tooBig && (
-        <Text style={styles.warn}>
-          Wants about {model.minRamGiB} GB of RAM; this device reports{' '}
-          {deviceRamGiB?.toFixed(1)} GB. It may load very slowly or be killed
-          by the system.
-        </Text>
-      )}
-
-      {model.mmproj && (
-        <Text style={styles.note}>
-          Two files: the model plus a {model.mmproj.approxSizeGiB.toFixed(2)} GB
-          vision projector. Both are needed before images work.
-        </Text>
-      )}
-
-      {(running || paused) && (
-        <View style={styles.progressBox}>
-          <ProgressBar fraction={fraction} />
+      {(running || paused || failed) && (
+        <View style={styles.progress}>
+          <ProgressBar
+            fraction={fraction}
+            color={failed ? c.danger : paused ? c.warning : c.accent}
+          />
           <Text style={styles.progressText}>
-            {live
-              ? `${live.part === 'mmproj' ? 'Projector' : 'Model'} · ${formatBytes(
-                  live.written,
-                )}${live.total > 0 ? ` of ${formatBytes(live.total)}` : ''}`
-              : 'Starting…'}
-            {paused ? ' · paused' : ''}
+            {failed
+              ? live?.message ?? 'Download failed.'
+              : paused
+              ? 'Paused — tap Resume to carry on from here.'
+              : `${formatBytes(live?.written ?? 0)}${
+                  live && live.total > 0 ? ` of ${formatBytes(live.total)}` : ''
+                }${live?.part === 'mmproj' ? ' · vision projector' : ''}`}
           </Text>
         </View>
       )}
-
-      {failed && !!errorMessage && <Text style={styles.error}>{errorMessage}</Text>}
 
       <View style={styles.actions}>
         {installed ? (
           <>
             <Pressable
-              style={[styles.btn, styles.btnPrimary]}
+              style={[styles.btn, styles.btnPrimary, active && styles.btnGhost]}
               onPress={onLoad}
               disabled={active}>
-              <Text style={styles.btnPrimaryText}>
-                {active ? 'In use' : 'Load'}
+              <Text style={[styles.btnPrimaryText, active && styles.btnGhostText]}>
+                {active ? 'Loaded' : 'Load'}
               </Text>
             </Pressable>
-            <Pressable style={styles.btn} onPress={onDelete}>
-              <Text style={styles.btnDangerText}>Delete</Text>
+            <Pressable style={[styles.btn, styles.btnGhost]} onPress={onDelete}>
+              <Text style={styles.btnGhostText}>Remove</Text>
             </Pressable>
           </>
         ) : running ? (
           <>
-            <Pressable style={styles.btn} onPress={onPause}>
-              <Text style={styles.btnText}>Pause</Text>
+            <Pressable style={[styles.btn, styles.btnGhost]} onPress={onPause}>
+              <Text style={styles.btnGhostText}>Pause</Text>
             </Pressable>
-            <Pressable style={styles.btn} onPress={onCancel}>
-              <Text style={styles.btnDangerText}>Cancel</Text>
+            <Pressable style={[styles.btn, styles.btnGhost]} onPress={onCancel}>
+              <Text style={styles.btnGhostText}>Cancel</Text>
             </Pressable>
           </>
         ) : (
           <>
-            <Pressable style={[styles.btn, styles.btnPrimary]} onPress={onDownload}>
+            <Pressable
+              style={[styles.btn, styles.btnPrimary]}
+              onPress={() => onDownload({ quantId, projectorId })}>
+              <Icon name="download" size={14} color={c.onAccent} />
               <Text style={styles.btnPrimaryText}>
                 {paused || failed ? 'Resume' : 'Download'}
               </Text>
             </Pressable>
-            <Pressable style={styles.btn} onPress={() => setShowLinks(v => !v)}>
-              <Text style={styles.btnText}>
-                {showLinks ? 'Hide links' : 'Get link'}
-              </Text>
-            </Pressable>
+            {model.quants.length > 1 || (model.mmproj?.length ?? 0) > 1 ? (
+              <Pressable
+                style={[styles.btn, styles.btnGhost]}
+                onPress={() => setOptionsOpen(true)}>
+                <Text style={styles.btnGhostText}>{quant.id}</Text>
+                <Icon name="chevronDown" size={11} color={c.textSecondary} />
+              </Pressable>
+            ) : null}
           </>
         )}
-      </View>
-
-      {showLinks && (
-        <View style={styles.links}>
-          <Text style={styles.linksIntro}>
-            Prefer your own download manager or browser? Take the file
-            yourself, save it to Downloads, then use “Import from storage” at
-            the top of this screen. Nothing here has to go through the app.
-          </Text>
-
-          <LinkRow label="Model file" url={modelUrl} />
-          {mmprojUrl && <LinkRow label="Vision projector" url={mmprojUrl} />}
-          <LinkRow label="All files in this repo" url={getRepoPageUrl(model)} />
-        </View>
-      )}
-    </View>
-  );
-}
-
-function LinkRow({ label, url }: { label: string; url: string }) {
-  const [copied, setCopied] = useState(false);
-  return (
-    <View style={styles.linkRow}>
-      <Text style={styles.linkLabel}>{label}</Text>
-      <Text style={styles.linkUrl} numberOfLines={2} selectable>
-        {url}
-      </Text>
-      <View style={styles.linkActions}>
         <Pressable
-          hitSlop={8}
-          onPress={() => {
-            DocKit.setClipboard(url);
-            setCopied(true);
-            setTimeout(() => setCopied(false), 1600);
-          }}>
-          <Text style={styles.linkAction}>{copied ? 'Copied' : 'Copy'}</Text>
-        </Pressable>
-        <Pressable hitSlop={8} onPress={() => DocKit.openUrl(url)}>
-          <Text style={styles.linkAction}>Open in browser</Text>
+          style={[styles.btn, styles.btnGhost]}
+          onPress={() => setLinksOpen(true)}>
+          <Icon name="link" size={14} color={c.textSecondary} />
+          <Text style={styles.btnGhostText}>Links</Text>
         </Pressable>
       </View>
+
+      <Sheet
+        visible={optionsOpen}
+        title={`${model.label} — download options`}
+        subtitle="Smaller quantisations use less memory and run faster; larger ones answer more accurately."
+        onClose={() => setOptionsOpen(false)}>
+        <SheetSection label="Quantisation" />
+        {model.quants.map(q => (
+          <SheetRow
+            key={q.id}
+            label={q.id}
+            detail={`${formatBytes(q.sizeBytes)}${q.note ? ` · ${q.note}` : ''}`}
+            selected={q.id === quantId}
+            onPress={() => setQuantId(q.id)}
+          />
+        ))}
+        {(model.mmproj?.length ?? 0) > 1 && (
+          <>
+            <SheetSection label="Vision projector" />
+            {model.mmproj!.map(p => (
+              <SheetRow
+                key={p.id}
+                label={p.id}
+                detail={formatBytes(p.sizeBytes)}
+                selected={p.id === projectorId}
+                onPress={() => setProjectorId(p.id)}
+              />
+            ))}
+          </>
+        )}
+      </Sheet>
+
+      <Sheet
+        visible={linksOpen}
+        title={`${model.label} — direct links`}
+        subtitle={`${model.repo} · ${model.license}. Download these with any browser or download manager and drop the file in your models folder; the app picks it up on its own.`}
+        onClose={() => setLinksOpen(false)}>
+        <SheetSection label="Model file" />
+        <SheetRow
+          icon="copy"
+          label={`Copy link · ${quant.id}`}
+          detail={`${quant.filename} · ${formatBytes(quant.sizeBytes)}`}
+          onPress={() => {
+            copy('Model', downloadUrl(model, quant.filename));
+            setLinksOpen(false);
+          }}
+        />
+        {!!projector && (
+          <>
+            <SheetSection label="Vision projector (needed for images)" />
+            <SheetRow
+              icon="copy"
+              label={`Copy link · ${projector.id}`}
+              detail={`${projector.filename} · ${formatBytes(projector.sizeBytes)}`}
+              onPress={() => {
+                copy('Projector', downloadUrl(model, projector.filename));
+                setLinksOpen(false);
+              }}
+            />
+          </>
+        )}
+        <SheetSection label="Elsewhere" />
+        <SheetRow
+          icon="link"
+          label="Open the repository"
+          detail="Every quantisation and file, on Hugging Face."
+          onPress={() => {
+            DocKit.openUrl(getRepoPageUrl(model));
+            setLinksOpen(false);
+          }}
+        />
+        <SheetRow
+          icon="download"
+          label="Open the file link in a browser"
+          detail="Hands the download to your browser or download manager instead."
+          onPress={() => {
+            DocKit.openUrl(downloadUrl(model, quant.filename));
+            setLinksOpen(false);
+          }}
+        />
+      </Sheet>
     </View>
   );
 }
 
-const styles = StyleSheet.create({
+const useStyles = makeStyles(c => ({
   card: {
-    backgroundColor: colors.surface,
+    backgroundColor: c.surface,
     borderRadius: radius.md,
     borderWidth: 1,
-    borderColor: colors.borderSoft,
-    padding: spacing.lg,
+    borderColor: c.borderSoft,
+    padding: spacing.md,
     marginBottom: spacing.md,
   },
-  cardActive: { borderColor: colors.accent },
-  headerRow: { flexDirection: 'row', alignItems: 'flex-start' },
-  titleBox: { flex: 1 },
+  cardActive: { borderColor: c.accent },
+  head: { flexDirection: 'row', alignItems: 'flex-start', gap: spacing.sm },
+  headText: { flex: 1, minWidth: 0 },
+  titleRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
   title: {
-    color: colors.textPrimary,
-    fontSize: fontSizes.lg,
+    color: c.textPrimary,
+    fontSize: fontSizes.md,
     fontWeight: '700',
+    flexShrink: 1,
   },
-  sub: { color: colors.textFaint, fontSize: fontSizes.xs, marginTop: 2 },
-  activePill: {
-    backgroundColor: colors.successSoft,
+  star: {
+    backgroundColor: c.accentSoft,
+    borderRadius: radius.pill,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 2,
+  },
+  starText: { color: c.accent, fontSize: 9, fontWeight: '700', letterSpacing: 0.4 },
+  meta: { color: c.textFaint, fontSize: fontSizes.xxs, marginTop: 2 },
+  installedPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    backgroundColor: c.successSoft,
     borderRadius: radius.pill,
     paddingHorizontal: spacing.sm,
     paddingVertical: 3,
   },
-  activePillText: {
-    color: colors.success,
-    fontSize: fontSizes.xxs,
-    fontWeight: '700',
-  },
-  tags: { flexDirection: 'row', flexWrap: 'wrap', marginTop: spacing.sm, gap: 6 },
-  tag: {
-    backgroundColor: colors.surfaceHigh,
-    borderRadius: radius.pill,
-    paddingHorizontal: spacing.sm,
-    paddingVertical: 3,
-  },
-  tagAccent: { backgroundColor: colors.accentSoft },
-  tagWarn: { backgroundColor: colors.warningSoft },
-  tagSuccess: { backgroundColor: colors.successSoft },
-  tagText: { color: colors.textSecondary, fontSize: fontSizes.xxs, fontWeight: '600' },
-  tagTextAccent: { color: colors.accent },
-  tagTextWarn: { color: colors.warning },
-  tagTextSuccess: { color: colors.success },
+  installedText: { color: c.success, fontSize: 10, fontWeight: '700' },
   description: {
-    color: colors.textSecondary,
+    color: c.textSecondary,
     fontSize: fontSizes.sm,
-    lineHeight: 19,
+    lineHeight: 20,
     marginTop: spacing.sm,
   },
-  note: {
-    color: colors.textFaint,
-    fontSize: fontSizes.xs,
-    lineHeight: 17,
+  tags: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: spacing.xs,
     marginTop: spacing.sm,
   },
-  warn: {
-    color: colors.warning,
-    fontSize: fontSizes.xs,
-    lineHeight: 17,
-    marginTop: spacing.sm,
+  tag: {
+    backgroundColor: c.surfaceAlt,
+    borderRadius: radius.pill,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 3,
   },
-  error: {
-    color: colors.danger,
-    fontSize: fontSizes.xs,
-    lineHeight: 17,
-    marginTop: spacing.sm,
-  },
-  progressBox: { marginTop: spacing.md },
-  progressText: {
-    color: colors.textFaint,
-    fontSize: fontSizes.xxs,
-    marginTop: spacing.xs,
-  },
+  tagText: { color: c.textSecondary, fontSize: 10, fontWeight: '600' },
+  tagWarn: { backgroundColor: c.warningSoft },
+  tagWarnText: { color: c.warning },
+  tagDanger: { backgroundColor: c.dangerSoft },
+  tagDangerText: { color: c.danger },
+  progress: { marginTop: spacing.md, gap: spacing.xs },
+  progressText: { color: c.textFaint, fontSize: fontSizes.xxs, lineHeight: 16 },
   actions: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: spacing.sm,
     marginTop: spacing.md,
-    flexWrap: 'wrap',
   },
   btn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
     borderRadius: radius.sm,
-    paddingHorizontal: spacing.lg,
-    paddingVertical: spacing.sm,
-    backgroundColor: colors.surfaceHigh,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm + 2,
   },
-  btnPrimary: { backgroundColor: colors.accent },
-  btnText: { color: colors.textPrimary, fontSize: fontSizes.sm, fontWeight: '600' },
-  btnPrimaryText: { color: colors.onAccent, fontSize: fontSizes.sm, fontWeight: '700' },
-  btnDangerText: { color: colors.danger, fontSize: fontSizes.sm, fontWeight: '600' },
-  links: {
-    marginTop: spacing.md,
-    paddingTop: spacing.md,
-    borderTopWidth: 1,
-    borderTopColor: colors.borderSoft,
-  },
-  linksIntro: {
-    color: colors.textSecondary,
-    fontSize: fontSizes.xs,
-    lineHeight: 18,
-    marginBottom: spacing.md,
-  },
-  linkRow: { marginBottom: spacing.md },
-  linkLabel: {
-    color: colors.textPrimary,
-    fontSize: fontSizes.xs,
-    fontWeight: '700',
-    marginBottom: 2,
-  },
-  linkUrl: {
-    color: colors.accent,
-    fontSize: fontSizes.xxs,
-    lineHeight: 16,
-    fontFamily: 'monospace',
-  },
-  linkActions: { flexDirection: 'row', gap: spacing.lg, marginTop: spacing.xs },
-  linkAction: { color: colors.textSecondary, fontSize: fontSizes.xs, fontWeight: '600' },
-});
+  btnPrimary: { backgroundColor: c.accent },
+  btnPrimaryText: { color: c.onAccent, fontSize: fontSizes.xs, fontWeight: '700' },
+  btnGhost: { backgroundColor: c.surfaceAlt },
+  btnGhostText: { color: c.textSecondary, fontSize: fontSizes.xs, fontWeight: '700' },
+}));

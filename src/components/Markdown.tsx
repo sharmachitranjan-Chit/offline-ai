@@ -1,24 +1,38 @@
-import React, { useMemo } from 'react';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import React, { useMemo, useState } from 'react';
+import { Pressable, ScrollView, Text, View } from 'react-native';
 import { DocKit } from '../native/DocKit';
-import { colors, fontSizes, radius, spacing } from '../theme';
+import { makeStyles, useColors } from '../context/ThemeContext';
+import { fontSizes, radius, spacing } from '../theme';
 
 /**
  * A deliberately small markdown renderer.
  *
- * Pulling in a full markdown library for this would add a dependency, a
- * bundle-size hit and an upgrade liability, to render the handful of
- * constructs a chat model actually produces: fenced code, headings, lists,
- * bold, italic and inline code. So it's hand-rolled.
+ * Pulling in a full markdown library would add a dependency, a bundle-size
+ * hit and an upgrade liability, to render the handful of constructs a chat
+ * model actually produces: fenced code, headings, lists, tables, quotes,
+ * bold, italic, links and inline code. So it's hand-rolled.
  */
 
 type Block =
   | { type: 'code'; lang: string; text: string }
   | { type: 'heading'; level: number; text: string }
-  | { type: 'list'; ordered: boolean; items: string[] }
+  | { type: 'list'; ordered: boolean; items: Array<{ text: string; depth: number }> }
+  | { type: 'table'; header: string[]; rows: string[][] }
   | { type: 'quote'; text: string }
   | { type: 'rule' }
   | { type: 'para'; text: string };
+
+const BULLET = /^(\s*)([-*+])\s+(.*)$/;
+const NUMBERED = /^(\s*)\d+[.)]\s+(.*)$/;
+
+function splitRow(line: string): string[] {
+  return line
+    .trim()
+    .replace(/^\|/, '')
+    .replace(/\|$/, '')
+    .split('|')
+    .map(cell => cell.trim());
+}
 
 function parse(src: string): Block[] {
   const blocks: Block[] = [];
@@ -46,7 +60,7 @@ function parse(src: string): Block[] {
       continue;
     }
 
-    if (/^\s*([-*_])\s*\1\s*\1[\s-*_]*$/.test(line)) {
+    if (/^\s*([-*_])\s*\1\s*\1[\s\-*_]*$/.test(line)) {
       blocks.push({ type: 'rule' });
       i++;
       continue;
@@ -54,12 +68,26 @@ function parse(src: string): Block[] {
 
     const heading = line.match(/^(#{1,6})\s+(.*)$/);
     if (heading) {
-      blocks.push({
-        type: 'heading',
-        level: heading[1].length,
-        text: heading[2],
-      });
+      blocks.push({ type: 'heading', level: heading[1].length, text: heading[2] });
       i++;
+      continue;
+    }
+
+    // A table needs a header row and a |---|---| separator underneath it.
+    if (
+      line.includes('|') &&
+      i + 1 < lines.length &&
+      /^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(lines[i + 1]) &&
+      lines[i + 1].includes('-')
+    ) {
+      const header = splitRow(line);
+      i += 2;
+      const rows: string[][] = [];
+      while (i < lines.length && lines[i].includes('|') && lines[i].trim()) {
+        rows.push(splitRow(lines[i]));
+        i++;
+      }
+      blocks.push({ type: 'table', header, rows });
       continue;
     }
 
@@ -73,15 +101,17 @@ function parse(src: string): Block[] {
       continue;
     }
 
-    const bullet = /^\s*([-*+])\s+(.*)$/;
-    const numbered = /^\s*\d+[.)]\s+(.*)$/;
-    if (bullet.test(line) || numbered.test(line)) {
-      const ordered = numbered.test(line);
-      const items: string[] = [];
+    if (BULLET.test(line) || NUMBERED.test(line)) {
+      const ordered = NUMBERED.test(line);
+      const items: Array<{ text: string; depth: number }> = [];
       while (i < lines.length) {
-        const m = lines[i].match(ordered ? numbered : bullet);
+        const m = lines[i].match(ordered ? NUMBERED : BULLET);
         if (!m) break;
-        items.push(ordered ? m[1] : m[2]);
+        const indent = m[1].length;
+        items.push({
+          text: ordered ? m[2] : m[3],
+          depth: Math.min(2, Math.floor(indent / 2)),
+        });
         i++;
       }
       blocks.push({ type: 'list', ordered, items });
@@ -94,8 +124,8 @@ function parse(src: string): Block[] {
       lines[i].trim() &&
       !lines[i].trimStart().startsWith('```') &&
       !/^(#{1,6})\s/.test(lines[i]) &&
-      !bullet.test(lines[i]) &&
-      !numbered.test(lines[i]) &&
+      !BULLET.test(lines[i]) &&
+      !NUMBERED.test(lines[i]) &&
       !/^\s*>\s?/.test(lines[i])
     ) {
       para.push(lines[i]);
@@ -107,18 +137,24 @@ function parse(src: string): Block[] {
   return blocks;
 }
 
-/** Renders bold / italic / inline-code / strikethrough inside a line. */
+/** Renders bold / italic / inline-code / strikethrough / links inside a line. */
 function Inline({ text, style }: { text: string; style?: any }) {
+  const styles = useStyles();
   const parts = useMemo(() => {
-    const out: Array<{ t: string; kind: string }> = [];
-    const re = /(`[^`]+`)|(\*\*[^*]+\*\*)|(__[^_]+__)|(\*[^*\n]+\*)|(~~[^~]+~~)/g;
+    const out: Array<{ t: string; kind: string; href?: string }> = [];
+    const re =
+      /(`[^`]+`)|(\*\*[^*]+\*\*)|(__[^_]+__)|(\*[^*\n]+\*)|(~~[^~]+~~)|(\[[^\]]+\]\([^)]+\))/g;
     let last = 0;
     let m: RegExpExecArray | null;
     while ((m = re.exec(text))) {
       if (m.index > last) out.push({ t: text.slice(last, m.index), kind: 'plain' });
       const tok = m[0];
       if (tok.startsWith('`')) out.push({ t: tok.slice(1, -1), kind: 'code' });
-      else if (tok.startsWith('**') || tok.startsWith('__'))
+      else if (tok.startsWith('[')) {
+        const label = tok.slice(1, tok.indexOf(']'));
+        const href = tok.slice(tok.indexOf('(') + 1, -1);
+        out.push({ t: label, kind: 'link', href });
+      } else if (tok.startsWith('**') || tok.startsWith('__'))
         out.push({ t: tok.slice(2, -2), kind: 'bold' });
       else if (tok.startsWith('~~')) out.push({ t: tok.slice(2, -2), kind: 'strike' });
       else out.push({ t: tok.slice(1, -1), kind: 'italic' });
@@ -133,6 +169,7 @@ function Inline({ text, style }: { text: string; style?: any }) {
       {parts.map((p, idx) => (
         <Text
           key={idx}
+          onPress={p.href ? () => DocKit.openUrl(p.href!) : undefined}
           style={
             p.kind === 'bold'
               ? styles.bold
@@ -142,6 +179,8 @@ function Inline({ text, style }: { text: string; style?: any }) {
               ? styles.strike
               : p.kind === 'code'
               ? styles.inlineCode
+              : p.kind === 'link'
+              ? styles.link
               : undefined
           }>
           {p.t}
@@ -152,33 +191,69 @@ function Inline({ text, style }: { text: string; style?: any }) {
 }
 
 function CodeBlock({ lang, text }: { lang: string; text: string }) {
+  const styles = useStyles();
+  const [copied, setCopied] = useState(false);
+
   return (
     <View style={styles.codeWrap}>
       <View style={styles.codeHeader}>
         <Text style={styles.codeLang}>{lang || 'code'}</Text>
         <Pressable
           hitSlop={10}
-          onPress={() => DocKit.setClipboard(text)}
+          onPress={() => {
+            DocKit.setClipboard(text);
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1600);
+          }}
           accessibilityLabel="Copy code">
-          <Text style={styles.copy}>Copy</Text>
+          <Text style={styles.copy}>{copied ? 'Copied' : 'Copy'}</Text>
         </Pressable>
       </View>
-      <Text style={styles.code} selectable>
-        {text}
-      </Text>
+      {/* Code is the one thing that must not be re-wrapped: a horizontal
+          scroller keeps indentation and long lines intact. */}
+      <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+        <Text style={styles.code} selectable>
+          {text}
+        </Text>
+      </ScrollView>
     </View>
+  );
+}
+
+function Table({ header, rows }: { header: string[]; rows: string[][] }) {
+  const styles = useStyles();
+  return (
+    <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.table}>
+      <View>
+        <View style={[styles.tableRow, styles.tableHead]}>
+          {header.map((cell, i) => (
+            <Inline key={i} text={cell} style={[styles.tableCell, styles.tableHeadCell]} />
+          ))}
+        </View>
+        {rows.map((row, r) => (
+          <View key={r} style={styles.tableRow}>
+            {row.map((cell, i) => (
+              <Inline key={i} text={cell} style={styles.tableCell} />
+            ))}
+          </View>
+        ))}
+      </View>
+    </ScrollView>
   );
 }
 
 export default function Markdown({
   content,
-  color = colors.textPrimary,
+  color,
 }: {
   content: string;
   color?: string;
 }) {
+  const c = useColors();
+  const styles = useStyles();
   const blocks = useMemo(() => parse(content), [content]);
-  const base = [styles.body, { color }];
+  const tint = color ?? c.textPrimary;
+  const base = [styles.body, { color: tint }];
 
   return (
     <View>
@@ -186,6 +261,8 @@ export default function Markdown({
         switch (b.type) {
           case 'code':
             return <CodeBlock key={i} lang={b.lang} text={b.text} />;
+          case 'table':
+            return <Table key={i} header={b.header} rows={b.rows} />;
           case 'heading':
             return (
               <Inline
@@ -193,7 +270,10 @@ export default function Markdown({
                 text={b.text}
                 style={[
                   styles.heading,
-                  { color, fontSize: Math.max(fontSizes.md, fontSizes.xl - b.level * 2) },
+                  {
+                    color: tint,
+                    fontSize: Math.max(fontSizes.md, fontSizes.xl - b.level * 2),
+                  },
                 ]}
               />
             );
@@ -209,11 +289,13 @@ export default function Markdown({
             return (
               <View key={i} style={styles.list}>
                 {b.items.map((item, j) => (
-                  <View key={j} style={styles.listRow}>
-                    <Text style={[styles.bullet, { color }]}>
+                  <View
+                    key={j}
+                    style={[styles.listRow, { paddingLeft: item.depth * spacing.lg }]}>
+                    <Text style={[styles.bullet, { color: tint }]}>
                       {b.ordered ? `${j + 1}.` : '•'}
                     </Text>
-                    <Inline text={item} style={[...base, styles.listText]} />
+                    <Inline text={item.text} style={[...base, styles.listText]} />
                   </View>
                 ))}
               </View>
@@ -228,10 +310,10 @@ export default function Markdown({
 
 const mono = 'monospace';
 
-const styles = StyleSheet.create({
+const useStyles = makeStyles(c => ({
   body: {
     fontSize: fontSizes.md,
-    lineHeight: 22,
+    lineHeight: 23,
   },
   para: { marginBottom: spacing.sm },
   heading: {
@@ -243,16 +325,17 @@ const styles = StyleSheet.create({
   bold: { fontWeight: '700' },
   italic: { fontStyle: 'italic' },
   strike: { textDecorationLine: 'line-through' },
+  link: { color: c.accent, textDecorationLine: 'underline' },
   inlineCode: {
     fontFamily: mono,
     fontSize: fontSizes.sm,
-    color: colors.accent,
+    color: c.accent,
   },
   codeWrap: {
-    backgroundColor: colors.code,
+    backgroundColor: c.code,
     borderRadius: radius.sm,
     borderWidth: 1,
-    borderColor: colors.border,
+    borderColor: c.borderSoft,
     marginVertical: spacing.sm,
     overflow: 'hidden',
   },
@@ -262,40 +345,58 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.xs,
-    backgroundColor: colors.surfaceAlt,
+    backgroundColor: c.codeBar,
   },
   codeLang: {
-    color: colors.textFaint,
+    color: c.textFaint,
     fontSize: fontSizes.xxs,
     textTransform: 'uppercase',
     letterSpacing: 0.6,
   },
-  copy: { color: colors.accent, fontSize: fontSizes.xs, fontWeight: '600' },
+  copy: { color: c.accent, fontSize: fontSizes.xs, fontWeight: '600' },
   code: {
     fontFamily: mono,
     fontSize: fontSizes.sm,
-    color: '#D8E1F0',
+    color: c.codeText,
     padding: spacing.md,
     lineHeight: 19,
   },
   rule: {
     height: 1,
-    backgroundColor: colors.border,
+    backgroundColor: c.border,
     marginVertical: spacing.md,
   },
   quote: {
     borderLeftWidth: 3,
-    borderLeftColor: colors.accentMuted,
+    borderLeftColor: c.accentMuted,
     paddingLeft: spacing.md,
     marginBottom: spacing.sm,
   },
-  quoteText: { color: colors.textSecondary, fontStyle: 'italic' },
+  quoteText: { color: c.textSecondary, fontStyle: 'italic' },
   list: { marginBottom: spacing.sm },
   listRow: { flexDirection: 'row', marginBottom: spacing.xs },
   bullet: {
     width: 22,
     fontSize: fontSizes.md,
-    lineHeight: 22,
+    lineHeight: 23,
   },
   listText: { flex: 1 },
-});
+  table: {
+    marginVertical: spacing.sm,
+    borderWidth: 1,
+    borderColor: c.borderSoft,
+    borderRadius: radius.sm,
+  },
+  tableRow: { flexDirection: 'row', borderTopWidth: 1, borderTopColor: c.borderSoft },
+  tableHead: { borderTopWidth: 0, backgroundColor: c.surfaceAlt },
+  tableCell: {
+    minWidth: 96,
+    maxWidth: 240,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    fontSize: fontSizes.sm,
+    lineHeight: 19,
+    color: c.textPrimary,
+  },
+  tableHeadCell: { fontWeight: '700' },
+}));
